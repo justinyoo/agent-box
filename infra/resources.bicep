@@ -24,7 +24,7 @@ param diskControllerType string
 param acceleratedNetworking bool
 param vnetAddressPrefix string
 param subnetAddressPrefix string
-param allowedRdpSource string
+param allowedRdpSources string[]
 param pythonVersion string
 param tags object
 
@@ -46,7 +46,7 @@ resource networkSecurityGroup 'Microsoft.Network/networkSecurityGroups@2025-09-0
   location: location
   tags: tags
   properties: {
-    securityRules: empty(allowedRdpSource) ? [] : [
+    securityRules: empty(allowedRdpSources) ? [] : [
       {
         name: 'allow-rdp-from-trusted-source'
         properties: {
@@ -54,7 +54,7 @@ resource networkSecurityGroup 'Microsoft.Network/networkSecurityGroups@2025-09-0
           direction: 'Inbound'
           access: 'Allow'
           protocol: 'Tcp'
-          sourceAddressPrefix: allowedRdpSource
+          sourceAddressPrefixes: allowedRdpSources
           sourcePortRange: '*'
           destinationAddressPrefix: '*'
           destinationPortRange: '3389'

@@ -65,6 +65,9 @@
     "allowedRdpSource": {
       "value": "${VM_RDP_SOURCE}"
     },
+    "additionalRdpSources": {
+      "value": "${VM_RDP_ADDITIONAL_SOURCES}"
+    },
     "pythonVersion": {
       "value": "${VM_PYTHON_VERSION}"
     },

@@ -5,7 +5,9 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 
 
@@ -47,6 +49,148 @@ def check_powershell(path):
         env={**ENV, "AGENTBOX_SCRIPT": str(path)})
 
 
+def check_bash_rdp_source():
+    script = ROOT / "scripts" / "get-rdp-source.sh"
+    run("bash", "-n", str(script))
+    with tempfile.TemporaryDirectory(prefix="agentbox-rdp-source-") as temporary:
+        directory = Path(temporary)
+        curl = directory / "curl"
+        curl.write_text(
+            '#!/usr/bin/env bash\n'
+            'printf "%s\\n" "$@" > "$AGENTBOX_CURL_ARGS"\n'
+            'printf "%s" "$AGENTBOX_IP_RESPONSE"\n'
+            'exit "$AGENTBOX_CURL_EXIT"\n'
+        )
+        curl.chmod(0o755)
+        arguments = directory / "curl-args"
+        cases = [
+            ("203.0.113.42", 0, "203.0.113.42/32\n"),
+            (" \t203.0.113.42\r\n", 0, "203.0.113.42/32\n"),
+            ("1.0.255.1", 0, "1.0.255.1/32\n"),
+            ("", 0, ""),
+            ("<html>error</html>", 0, ""),
+            ("256.0.0.1", 0, ""),
+            ("01.2.3.4", 0, ""),
+            ("127.1", 0, ""),
+            ("::1", 0, ""),
+            ("203.0.113.42/32", 0, ""),
+            ("*", 0, ""),
+            ("203.0.113.42\n203.0.113.43", 0, ""),
+            ("", 22, ""),
+            ("203.0.113.42", 28, ""),
+        ]
+        for response, status, expected in cases:
+            result = subprocess.run(
+                ["bash", str(script)], cwd=ROOT, text=True, capture_output=True,
+                env={**ENV, "PATH": str(directory) + os.pathsep + ENV["PATH"],
+                     "AGENTBOX_CURL_ARGS": str(arguments), "AGENTBOX_IP_RESPONSE": response,
+                     "AGENTBOX_CURL_EXIT": str(status)},
+            )
+            assert result.stdout == expected, f"Unexpected source output for {response!r}: {result.stdout!r}"
+            assert (result.returncode == 0) == bool(expected), f"Wrong exit status for {response!r}."
+            assert bool(result.stderr) == (not expected), f"Wrong error output for {response!r}."
+            assert arguments.read_text().splitlines() == [
+                "-q", "--ipv4", "--fail", "--silent", "--show-error",
+                "--connect-timeout", "5", "--max-time", "15", "https://api.ipify.org",
+            ]
+    print(f"{len(cases)} isolated Bash RDP source checks passed.")
+
+
+def check_preprovision_hooks():
+    azd = shutil.which("azd")
+    assert azd, "azd is required to validate preprovision hooks."
+    with tempfile.TemporaryDirectory(prefix="agentbox-hooks-") as temporary:
+        directory = Path(temporary)
+        shutil.copyfile(ROOT / "azure.yaml", directory / "azure.yaml")
+        scripts = directory / "scripts"
+        scripts.mkdir()
+        (scripts / "get-rdp-source.sh").write_text(
+            '#!/usr/bin/env bash\n'
+            'if [ "$AGENTBOX_LOOKUP_FAIL" = 1 ]; then echo "Synthetic lookup failure" >&2; exit 1; fi\n'
+            'printf "%s\\n" "203.0.113.42/32"\n'
+        )
+        (scripts / "Get-RdpSource.ps1").write_text(
+            'if ($env:AGENTBOX_LOOKUP_FAIL -eq "1") { throw "Synthetic lookup failure" }\n'
+            '"203.0.113.42/32"\n'
+        )
+        for name in ("hook-default", "hook-target"):
+            environment = directory / ".azure" / name
+            environment.mkdir(parents=True)
+            (environment / ".env").write_text(
+                f'AZURE_ENV_NAME="{name}"\nVM_RDP_SOURCE="198.51.100.9/32"\n'
+            )
+        (directory / ".azure" / "config.json").write_text(
+            json.dumps({"defaultEnvironment": "hook-default"})
+        )
+        binary = directory / "bin"
+        binary.mkdir()
+        arguments = directory / "azd-args.json"
+        fake_azd = binary / "fake_azd.py"
+        fake_azd.write_text(
+            'import json, os, sys\n'
+            'from pathlib import Path\n'
+            'Path(os.environ["AGENTBOX_AZD_ARGS"]).write_text(json.dumps(sys.argv[1:]))\n'
+            'sys.exit(int(os.environ["AGENTBOX_AZD_EXIT"]))\n'
+        )
+        stub = binary / "azd"
+        stub.write_text('#!/usr/bin/env bash\nexec "$AGENTBOX_PYTHON" "$AGENTBOX_FAKE_AZD" "$@"\n')
+        stub.chmod(0o755)
+        (binary / "azd.cmd").write_text('@"%AGENTBOX_PYTHON%" "%AGENTBOX_FAKE_AZD%" %*\n')
+        for platform in ("posix", "windows"):
+            for lookup_fails, save_status in ((False, 0), (True, 0), (False, 1)):
+                arguments.unlink(missing_ok=True)
+                result = subprocess.run(
+                    [azd, "hooks", "run", "preprovision", "--platform", platform,
+                     "--environment", "hook-target", "--no-prompt"],
+                    cwd=directory, text=True, capture_output=True,
+                    env={**ENV, "PATH": str(binary) + os.pathsep + ENV["PATH"],
+                         "AGENTBOX_LOOKUP_FAIL": str(int(lookup_fails)),
+                         "AGENTBOX_AZD_EXIT": str(save_status), "AGENTBOX_AZD_ARGS": str(arguments),
+                         "AGENTBOX_PYTHON": sys.executable, "AGENTBOX_FAKE_AZD": str(fake_azd)},
+                )
+                expected_success = not lookup_fails and save_status == 0
+                assert (result.returncode == 0) == expected_success, (
+                    f"{platform} hook returned {result.returncode}:\n{result.stdout}\n{result.stderr}"
+                )
+                if lookup_fails:
+                    assert not arguments.exists(), "Failed lookup attempted to save an RDP source."
+                    assert "Synthetic lookup failure" in result.stdout + result.stderr
+                else:
+                    assert arguments.exists(), f"{platform} hook did not call azd env set."
+                    assert json.loads(arguments.read_text()) == [
+                        "env", "set", "VM_RDP_SOURCE", "203.0.113.42/32", "--environment", "hook-target",
+                    ], "Hook did not refresh the source in the requested environment."
+    print("6 isolated preprovision hook checks passed.")
+
+
+def check_rdp_allowlist(directory, main_source, resources_source):
+    expression = re.search(r"^var rdpSources = (.+)$", main_source, re.M).group(1)
+    for current, additional, expected in (
+        ("", "[]", []),
+        ("203.0.113.10/32", "[]", ["203.0.113.10/32"]),
+        ("", '["198.51.100.0/24"]', ["198.51.100.0/24"]),
+        ("203.0.113.10/32", '["203.0.113.10/32","198.51.100.0/24"]',
+         ["203.0.113.10/32", "198.51.100.0/24"]),
+    ):
+        declarations = f"var allowedRdpSource = {literal(current)}\nvar additionalRdpSources = {literal(additional)}"
+        assert evaluate(directory, expression, declarations) == expected
+    evaluate(directory, expression, "var allowedRdpSource = ''\nvar additionalRdpSources = 'invalid-json'", succeeds=False)
+    evaluate(directory, expression, "var allowedRdpSource = ''\nvar additionalRdpSources = '{}'", succeeds=False)
+    rules_expression = re.search(
+        r"securityRules: (empty\(allowedRdpSources\)[\s\S]+?^    \])", resources_source, re.M
+    ).group(1)
+    assert evaluate(directory, rules_expression, "var allowedRdpSources = []") == []
+    for sources in (["203.0.113.10/32"], ["203.0.113.10/32", "198.51.100.0/24"]):
+        rules = evaluate(directory, rules_expression, f"var allowedRdpSources = json({literal(json.dumps(sources))})")
+        assert len(rules) == 1
+        assert rules[0]["properties"]["sourceAddressPrefixes"] == sources
+        assert "sourceAddressPrefix" not in rules[0]["properties"]
+        assert rules[0]["properties"]["protocol"] == "Tcp"
+        assert rules[0]["properties"]["destinationPortRange"] == "3389"
+    assert "output VM_RDP_ENABLED bool = !empty(rdpSources)" in main_source
+    print("RDP allowlist merge and NSG rule contracts passed.")
+
+
 def main():
     main_source = (INFRA / "main.bicep").read_text()
     resources_source = (INFRA / "resources.bicep").read_text()
@@ -64,7 +208,10 @@ def main():
         assert resource_group["apiVersion"] == "2025-04-01"
         deployment = next(r for r in template["resources"] if r["type"] == "Microsoft.Resources/deployments")
         child = deployment["properties"]["template"]
-        resources = {r["type"]: r for r in child["resources"]}
+        child_resources = child["resources"]
+        if isinstance(child_resources, dict):
+            child_resources = child_resources.values()
+        resources = {r["type"]: r for r in child_resources}
         assert set(resources) == {
             "Microsoft.Network/networkSecurityGroups",
             "Microsoft.Network/virtualNetworks",
@@ -87,6 +234,9 @@ def main():
         assert template["parameters"]["enrollmentAdminUsername"]["defaultValue"] == "enrolleduser"
         assert template["parameters"]["pythonVersion"]["defaultValue"] == "3.14"
         assert template["parameters"]["allowedRdpSource"]["defaultValue"] == ""
+        # ARM escapes a literal string that starts with '['.
+        assert template["parameters"]["additionalRdpSources"]["defaultValue"] == "[[]"
+        assert template["parameters"]["additionalRdpSources"]["type"] == "string"
         assert template["parameters"]["zone"]["allowedValues"] == ["", "1", "2", "3"]
         assert template["parameters"]["acceleratedNetworking"]["allowedValues"] == ["true", "false"]
         vm = resources["Microsoft.Compute/virtualMachines"]
@@ -114,6 +264,7 @@ def main():
         variables = {re.fullmatch(r"\$\{([A-Z0-9_]+)\}", p["value"]).group(1) for p in bindings.values()}
         assert variables.isdisjoint(template["outputs"]), "Outputs must not become implicit input overrides."
         assert bindings["osDiskSizeGb"]["value"] == "${VM_OS_DISK_SIZE_GB}"
+        assert bindings["additionalRdpSources"]["value"] == "${VM_RDP_ADDITIONAL_SOURCES}"
         assert deployment["properties"]["parameters"]["osDiskSizeGb"]["value"] == "[int(parameters('osDiskSizeGb'))]"
         assert evaluate(directory, "int(osDiskSizeGb)", "var osDiskSizeGb = '256'") == 256
         evaluate(directory, "int(osDiskSizeGb)", "var osDiskSizeGb = 'not-a-number'", succeeds=False)
@@ -141,15 +292,7 @@ def main():
             assert re.fullmatch(r"ab-[a-z0-9]{12}", values["computerName"])
         assert names[0]["computerName"] != names[1]["computerName"]
 
-        rules_expression = re.search(
-            r"securityRules: (empty\(allowedRdpSource\)[\s\S]+?^    \])", resources_source, re.M
-        ).group(1)
-        assert evaluate(directory, rules_expression, "var allowedRdpSource = ''") == []
-        rules = evaluate(directory, rules_expression, "var allowedRdpSource = '203.0.113.10/32'")
-        assert len(rules) == 1
-        assert rules[0]["properties"]["sourceAddressPrefix"] == "203.0.113.10/32"
-        assert rules[0]["properties"]["protocol"] == "Tcp"
-        assert rules[0]["properties"]["destinationPortRange"] == "3389"
+        check_rdp_allowlist(directory, main_source, resources_source)
         assert resources_source.count("zones: empty(zone) ? [] : [zone]") == 2
         assert evaluate(directory, "empty(zone) ? [] : [zone]", "var zone = ''") == []
         assert evaluate(directory, "empty(zone) ? [] : [zone]", "var zone = '2'") == ["2"]
@@ -189,7 +332,10 @@ def main():
         extension = resources["Microsoft.Compute/virtualMachines/extensions"]
         assert extension["properties"]["type"] == "CustomScriptExtension"
         assert "settings" not in extension["properties"]
-        assert any("stage-guest-scripts" in dependency for dependency in extension["dependsOn"])
+        assert any(
+            dependency == "stageGuestScripts" or "stage-guest-scripts" in dependency
+            for dependency in extension["dependsOn"]
+        )
         assert "adminPassword" not in json.dumps(child["variables"]["guestConfiguration"])
         assert "adminPassword" not in child["variables"]["setupFingerprint"]
         command_expression = re.search(r"^      commandToExecute: (.+)$", resources_source, re.M).group(1)
@@ -226,7 +372,10 @@ def main():
         assert not re.search(r"\b[A-Za-z]:\\", readme), "README filesystem examples must use POSIX separators."
 
     run("pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(ROOT / "tests" / "Test-Scripts.ps1"))
-    print("Bicep, parameter, resource-graph, payload, and isolated PowerShell checks passed.")
+    check_bash_rdp_source()
+    check_preprovision_hooks()
+    run(sys.executable, str(ROOT / "tests" / "test_rdp_sources.py"))
+    print("Bicep, parameter, resource-graph, payload, PowerShell/Bash, and hook checks passed.")
     print("No Azure resources, Windows accounts, or software installations were changed.")
 
 

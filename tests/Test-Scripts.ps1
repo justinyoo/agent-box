@@ -261,4 +261,41 @@ Test-Case 'WinGet scopes and installer architectures remain explicit for all nin
     }
 }
 
+Test-Case 'RDP source lookup emits only a single-host IPv4 CIDR' {
+    function Invoke-RestMethod { param($Uri, $TimeoutSec, $MaximumRedirection, $ErrorAction)
+        Assert-True ($Uri -eq 'https://api.ipify.org') 'Wrong IPv4 lookup service.'
+        Assert-True ($TimeoutSec -eq 15 -and $MaximumRedirection -eq 0 -and $ErrorAction -eq 'Stop') 'Unsafe HTTP options.'
+        return $ipResponse
+    }
+    foreach ($response in @('203.0.113.42', " `t203.0.113.42`r`n", '1.0.255.1')) {
+        $ipResponse = $response
+        $result = @(& (Join-Path $project 'scripts/Get-RdpSource.ps1'))
+        Assert-True ($result.Count -eq 1 -and $result[0] -ceq "$($response.Trim())/32") 'Unexpected source output.'
+    }
+}
+Test-Case 'RDP source lookup rejects malformed responses without success output' {
+    function Invoke-RestMethod { param($Uri, $TimeoutSec, $MaximumRedirection, $ErrorAction)
+        return $ipResponse
+    }
+    foreach ($response in @('', '<html>error</html>', '256.0.0.1', '01.2.3.4', '127.1',
+        '::1', '203.0.113.42/32', '*', "203.0.113.42`n203.0.113.43", @{ ip = '203.0.113.42' })) {
+        $ipResponse = $response
+        $output = [Collections.Generic.List[object]]::new()
+        Assert-Throws {
+            & (Join-Path $project 'scripts/Get-RdpSource.ps1') | ForEach-Object { $output.Add($_) }
+        } '*did not return a valid IPv4 address*'
+        Assert-True ($output.Count -eq 0) 'Invalid response emitted a source value.'
+    }
+}
+Test-Case 'RDP source lookup surfaces HTTP and network failures' {
+    function Invoke-RestMethod { param($Uri, $TimeoutSec, $MaximumRedirection, $ErrorAction)
+        throw 'Synthetic HTTP or timeout failure.'
+    }
+    $output = [Collections.Generic.List[object]]::new()
+    Assert-Throws {
+        & (Join-Path $project 'scripts/Get-RdpSource.ps1') | ForEach-Object { $output.Add($_) }
+    } '*Synthetic HTTP or timeout failure*'
+    Assert-True ($output.Count -eq 0) 'Failed lookup emitted a source value.'
+}
+
 Write-Host "$script:passed isolated script checks passed. Windows integration remains a separate validation step."

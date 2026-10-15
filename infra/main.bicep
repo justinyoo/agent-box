@@ -7,7 +7,7 @@ param environmentName string = 'dev'
 
 @description('Azure region. Size, image, zone, and policy compatibility must be checked when changing it.')
 @minLength(1)
-param location string = 'westus2'
+param location string
 
 @description('Resource name prefix. Use letters, digits, and hyphens.')
 @minLength(1)
@@ -88,9 +88,12 @@ param vnetAddressPrefix string = '172.16.0.0/16'
 @maxLength(18)
 param subnetAddressPrefix string = '172.16.0.0/24'
 
-@description('Trusted source IPv4 address/CIDR for TCP 3389. Empty means no public RDP allow rule.')
+@description('Current trusted source IPv4 address/CIDR for TCP 3389. Combined with additionalRdpSources.')
 @maxLength(18)
 param allowedRdpSource string = ''
+
+@description('JSON array text of additional trusted IPv4 addresses/CIDRs for TCP 3389. Combined with allowedRdpSource; both empty means no public RDP allow rule.')
+param additionalRdpSources string = '[]'
 
 @description('Python major.minor version installed through uv at the secondary administrator first sign-in.')
 @minLength(3)
@@ -100,7 +103,8 @@ param pythonVersion string = '3.14'
 @description('Additional resource tags. The azd environment identity tag cannot be overridden.')
 param tags object = {}
 
-var resourceGroupName = 'rg-${namePrefix}-${environmentName}-${take(uniqueString(subscription().id, environmentName, namePrefix), 6)}'
+var resourceGroupName = 'rg-${namePrefix}-${environmentName}'
+var rdpSources = union(empty(allowedRdpSource) ? [] : [allowedRdpSource], json(additionalRdpSources))
 var resourceTags = union(tags, {
   'azd-env-name': environmentName
 })
@@ -133,7 +137,7 @@ module resources './resources.bicep' = {
     acceleratedNetworking: bool(acceleratedNetworking)
     vnetAddressPrefix: vnetAddressPrefix
     subnetAddressPrefix: subnetAddressPrefix
-    allowedRdpSource: allowedRdpSource
+    allowedRdpSources: rdpSources
     pythonVersion: pythonVersion
     tags: resourceTags
   }
@@ -145,7 +149,7 @@ output VM_RESOURCE_ID string = resources.outputs.vmId
 output VM_COMPUTER_NAME string = resources.outputs.computerName
 output VM_PUBLIC_IP string = resources.outputs.publicIpAddress
 output VM_RDP_ENDPOINT string = resources.outputs.rdpEndpoint
-output VM_RDP_ENABLED bool = !empty(allowedRdpSource)
+output VM_RDP_ENABLED bool = !empty(rdpSources)
 output ENROLLMENT_SCRIPT_PATH string = resources.outputs.enrollmentScriptPath
 output DEV_TOOLS_SCRIPT_PATH string = resources.outputs.devToolsScriptPath
 output DEV_TOOLS_TASK_PATH string = resources.outputs.devToolsTaskPath
