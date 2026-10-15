@@ -1,0 +1,75 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environmentName": {
+      "value": "${AZURE_ENV_NAME}"
+    },
+    "location": {
+      "value": "${AZURE_LOCATION}"
+    },
+    "namePrefix": {
+      "value": "${VM_NAME_PREFIX}"
+    },
+    "vmName": {
+      "value": "${VM_NAME_OVERRIDE}"
+    },
+    "computerName": {
+      "value": "${VM_COMPUTER_NAME_OVERRIDE}"
+    },
+    "vmSize": {
+      "value": "${VM_SIZE}"
+    },
+    "zone": {
+      "value": "${VM_ZONE}"
+    },
+    "imagePublisher": {
+      "value": "${VM_IMAGE_PUBLISHER}"
+    },
+    "imageOffer": {
+      "value": "${VM_IMAGE_OFFER}"
+    },
+    "imageSku": {
+      "value": "${VM_IMAGE_SKU}"
+    },
+    "imageVersion": {
+      "value": "${VM_IMAGE_VERSION}"
+    },
+    "adminUsername": {
+      "value": "${VM_ADMIN_USERNAME}"
+    },
+    "enrollmentAdminUsername": {
+      "value": "${VM_ENROLLMENT_ADMIN_USERNAME}"
+    },
+    "adminPassword": {
+      "value": "${VM_ADMIN_PASSWORD}"
+    },
+    "osDiskSizeGb": {
+      "value": "${VM_OS_DISK_SIZE_GB}"
+    },
+    "osDiskType": {
+      "value": "${VM_OS_DISK_TYPE}"
+    },
+    "diskControllerType": {
+      "value": "${VM_DISK_CONTROLLER}"
+    },
+    "acceleratedNetworking": {
+      "value": "${VM_ACCELERATED_NETWORKING}"
+    },
+    "vnetAddressPrefix": {
+      "value": "${VM_VNET_PREFIX}"
+    },
+    "subnetAddressPrefix": {
+      "value": "${VM_SUBNET_PREFIX}"
+    },
+    "allowedRdpSource": {
+      "value": "${VM_RDP_SOURCE}"
+    },
+    "pythonVersion": {
+      "value": "${VM_PYTHON_VERSION}"
+    },
+    "tags": {
+      "value": "${VM_TAGS}"
+    }
+  }
+}

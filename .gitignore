@@ -1,0 +1,9 @@
+.azure/
+.env
+.env.*
+!.env.example
+*.local.parameters.json
+infra/main.json
+infra/resources.json
+*.log
+__pycache__/
