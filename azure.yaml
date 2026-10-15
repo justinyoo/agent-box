@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://aka.ms/azure.yaml.json
+name: agent-box
+
+requiredVersions:
+  azd: ">= 1.35.1"
+
+infra:
+  provider: bicep
+  path: infra
+  module: main
+
+hooks:
+  preprovision:
+    posix:
+      shell: sh
+      run: |
+        set -eu
+        rdp_source=$(bash ./scripts/get-rdp-source.sh)
+        azd env set VM_RDP_SOURCE "$rdp_source" --environment "$AZURE_ENV_NAME"
+    windows:
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $rdpSource = ./scripts/Get-RdpSource.ps1
+        azd env set VM_RDP_SOURCE $rdpSource --environment $env:AZURE_ENV_NAME
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to save VM_RDP_SOURCE in the azd environment.' }
