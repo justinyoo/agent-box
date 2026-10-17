@@ -191,6 +191,278 @@ def check_rdp_allowlist(directory, main_source, resources_source):
     print("RDP allowlist merge and NSG rule contracts passed.")
 
 
+def check_foundry(directory, template, main_source):
+    expected_regions = {
+        "location": [
+            "eastus", "eastus2", "centralus", "westus2", "westus3", "southcentralus", "uksouth",
+        ],
+        "gptImage25Region": [
+            "eastus2", "polandcentral", "swedencentral", "uaenorth", "westus3",
+        ],
+        "gpt6AstraRegion": [
+            "australiaeast", "brazilsouth", "canadacentral", "canadaeast", "centralus",
+            "eastus", "eastus2", "francecentral", "germanywestcentral", "italynorth",
+            "japaneast", "koreacentral", "northcentralus", "norwayeast", "polandcentral",
+            "southafricanorth", "southcentralus", "southeastasia", "southindia",
+            "spaincentral", "swedencentral", "switzerlandnorth", "switzerlandwest",
+            "uaenorth", "uksouth", "westeurope", "westus", "westus3",
+        ],
+        "claudeOpus55Region": [
+            "centralus", "eastus", "eastus2", "northcentralus", "southcentralus",
+            "swedencentral", "westcentralus", "westus", "westus3",
+        ],
+    }
+    readme = (ROOT / "README.md").read_text()
+    for name, regions in expected_regions.items():
+        parameter = template["parameters"][name]
+        assert "defaultValue" not in parameter, f"{name} must prompt when unset."
+        assert parameter["allowedValues"] == regions, f"Wrong region allowlist for {name}."
+        row_name = "AZURE_LOCATION" if name == "location" else name
+        row = next(line for line in readme.splitlines() if line.startswith(f"| `{row_name}`"))
+        region_text = row.split("choose ", 1)[1] if name == "location" else row.split("|")[3]
+        documented = re.findall(r"`([^`]+)`", region_text)
+        assert set(documented) == set(regions), f"README regions drifted for {name}."
+
+    bindings = json.loads((INFRA / "main.parameters.json").read_text())["parameters"]
+    expected_bindings = {
+        "gptImage25Region": "GPT_IMAGE_25_REGION",
+        "gpt6AstraRegion": "GPT_6_ASTRA_REGION",
+        "claudeOpus55Region": "CLAUDE_OPUS_55_REGION",
+        "gptImage25Capacity": "GPT_IMAGE_25_CAPACITY",
+        "gpt6AstraCapacity": "GPT_6_ASTRA_CAPACITY",
+        "claudeOpus55Capacity": "CLAUDE_OPUS_55_CAPACITY",
+        "claudeOrganizationName": "CLAUDE_ORGANIZATION_NAME",
+        "claudeCountryCode": "CLAUDE_COUNTRY_CODE",
+        "claudeIndustry": "CLAUDE_INDUSTRY",
+    }
+    for name, variable in expected_bindings.items():
+        assert bindings[name]["value"] == "${" + variable + "}"
+
+    required = {
+        "location": "westus2",
+        "adminPassword": "NotARealCredential-A9!",
+        "gptImage25Region": "eastus2",
+        "gpt6AstraRegion": "uksouth",
+        "claudeOpus55Region": "westus3",
+        "claudeOrganizationName": "Synthetic validation organization",
+        "claudeCountryCode": "us",
+        "claudeIndustry": "technology",
+    }
+
+    def build_parameters(values, succeeds=True):
+        fixture = directory / "foundry-fixture.bicepparam"
+        source = os.path.relpath(INFRA / "main.bicep", directory).replace(os.sep, "/")
+        fixture.write_text(
+            f"using {literal(source)}\n"
+            + "\n".join(f"param {key} = {literal(value)}" for key, value in values.items())
+            + "\n"
+        )
+        return run("az", "bicep", "build-params", "--file", str(fixture),
+                   "--outfile", str(directory / "foundry-fixture.json"), succeeds=succeeds)
+
+    build_parameters(required)
+    for name, invalid in (
+        ("location", "northeurope"),
+        ("gptImage25Region", "westus2"),
+        ("gpt6AstraRegion", "westus2"),
+        ("claudeOpus55Region", "westus2"),
+        ("gptImage25Region", "japaneast"),
+        ("claudeOpus55Region", "polandcentral"),
+        ("claudeIndustry", "invalid-industry"),
+        ("claudeOrganizationName", ""),
+        ("claudeCountryCode", "USA"),
+    ):
+        build_parameters({**required, name: invalid}, succeeds=False)
+    for name in ("gptImage25Region", "gpt6AstraRegion", "claudeOpus55Region",
+                 "claudeOrganizationName", "claudeCountryCode", "claudeIndustry"):
+        assert "defaultValue" not in template["parameters"][name]
+    build_parameters({key: value for key, value in required.items() if key != "gptImage25Region"},
+                     succeeds=False)
+
+    foundry = next(r for r in template["resources"] if r.get("copy", {}).get("name") == "foundry")
+    assert foundry["copy"]["count"] == "[length(variables('foundryConfigurations'))]"
+    assert foundry["name"] == "[format('agent-box-foundry-{0}', variables('foundryConfigurations')[copyIndex()].location)]"
+    assert foundry["resourceGroup"] == "[variables('resourceGroupName')]"
+    for name in ("name", "location", "deployments"):
+        assert foundry["properties"]["parameters"][name]["value"] == (
+            f"[variables('foundryConfigurations')[copyIndex()].{name}]"
+        )
+    assert foundry["properties"]["parameters"]["tags"]["value"] == "[variables('resourceTags')]"
+    child = foundry["properties"]["template"]
+    resources = child["resources"]
+    assert set(resources) == {"account", "project", "modelDeployments"}
+    account, project, deployments = (resources[name] for name in ("account", "project", "modelDeployments"))
+    assert account["type"] == "Microsoft.CognitiveServices/accounts"
+    assert project["type"] == "Microsoft.CognitiveServices/accounts/projects"
+    assert account["apiVersion"] == project["apiVersion"] == "2025-06-01"
+    assert account["kind"] == "AIServices" and account["sku"] == {"name": "S0"}
+    for resource in (account, project):
+        assert resource["location"] == "[parameters('location')]"
+        assert resource["tags"] == "[parameters('tags')]"
+        assert resource["identity"] == {"type": "SystemAssigned"}
+    assert account["properties"] == {
+        "allowProjectManagement": True,
+        "customSubDomainName": "[parameters('name')]",
+        "publicNetworkAccess": "Enabled",
+        "disableLocalAuth": False,
+    }
+    assert project["dependsOn"] == ["account"]
+    assert "parameters('name')" in project["name"]
+    assert deployments["type"] == "Microsoft.CognitiveServices/accounts/deployments"
+    assert deployments["apiVersion"] == "2025-10-01-preview"
+    assert "location" not in deployments, "Models must inherit their account's region."
+    assert deployments["copy"] == {
+        "name": "modelDeployments", "count": "[length(parameters('deployments'))]",
+        "mode": "serial", "batchSize": 1,
+    }
+    assert deployments["sku"] == {
+        "name": "GlobalStandard",
+        "capacity": "[parameters('deployments')[copyIndex()].capacity]",
+    }
+    assert set(deployments["dependsOn"]) == {"account", "project"}
+    assert child["definitions"]["modelDeployment"]["properties"]["capacity"]["minValue"] == 1
+
+    definitions = "\n".join(
+        re.search(pattern, main_source, re.M).group(0)
+        for pattern in (
+            r"^var resourceGroupName = .+$",
+            r"^var modelDeployments = \[[\s\S]+?^\]$",
+            r"^var foundryRegions = .+$",
+            r"^var foundryConfigurations = \[for[\s\S]+?^\}\]$",
+        )
+    ).replace("subscription().id", "testSubscription")
+    model_names = ["gpt-image-2.5-sunburst", "gpt-6-astra", "claude-opus-5-5"]
+    model_versions = ["2026-09-08", "2026-09-03", "2"]
+    model_regions = ["gptImage25Region", "gpt6AstraRegion", "claudeOpus55Region"]
+    output_prefixes = ["GPT_IMAGE_25", "GPT_6_ASTRA", "CLAUDE_OPUS_55"]
+    output_indices = {}
+    for index, prefix in enumerate(output_prefixes):
+        output = re.search(
+            rf"^output {prefix}_BASE_URL string = foundry\[(.+)\]\.outputs\.(\w+)$",
+            main_source, re.M,
+        )
+        assert output, f"Missing region-specific output for {prefix}."
+        output_indices[prefix] = output.group(1)
+        assert output.group(1) == f"indexOf(foundryRegions, {model_regions[index]})"
+        assert output.group(2) == ("anthropicBaseUrl" if index == 2 else "openAiBaseUrl")
+        assert template["outputs"][f"{prefix}_DEPLOYMENT_NAME"]["value"] == (
+            f"[variables('modelDeployments')[{index}].deployment.name]"
+        )
+    result_expression = (
+        "{ configurations: foundryConfigurations, routing: {\n"
+        + "\n".join(f"{prefix}: foundryConfigurations[{expression}].name"
+                    for prefix, expression in output_indices.items())
+        + "\n} }"
+    )
+    defaults = {
+        name: parameter["defaultValue"]
+        for name, parameter in template["parameters"].items()
+        if name in ("gptImage25Capacity", "gpt6AstraCapacity", "claudeOpus55Capacity")
+    }
+    assert defaults == {"gptImage25Capacity": "3", "gpt6AstraCapacity": "10", "claudeOpus55Capacity": "10"}
+    common = {
+        **defaults, "environmentName": "validation-a", "namePrefix": "agentbox",
+        "testSubscription": "00000000-0000-0000-0000-000000000000",
+        **{name: required[name] for name in ("claudeOrganizationName", "claudeCountryCode", "claudeIndustry")},
+    }
+    names_by_region = {}
+    example_deployments = {}
+    for regions in (
+        ("eastus2", "eastus2", "eastus2"),
+        ("eastus2", "swedencentral", "eastus2"),
+        ("eastus2", "eastus2", "swedencentral"),
+        ("eastus2", "swedencentral", "swedencentral"),
+        ("swedencentral", "eastus2", "eastus2"),
+        ("polandcentral", "japaneast", "westus3"),
+        ("westus3", "polandcentral", "swedencentral"),
+    ):
+        inputs = {**common, **dict(zip(model_regions, regions))}
+        declarations = "\n".join(f"var {name} = {literal(value)}" for name, value in inputs.items())
+        result = evaluate(directory, result_expression, declarations + "\n" + definitions)
+        groups = result["configurations"]
+        assert [group["location"] for group in groups] == list(dict.fromkeys(regions))
+        assert len({group["name"] for group in groups}) == len(set(regions))
+        for group in groups:
+            region = group["location"]
+            assert re.fullmatch(r"ai-[a-z0-9]{13}", group["name"])
+            assert names_by_region.setdefault(region, group["name"]) == group["name"], (
+                "Account names must not depend on model ordering or which models share a region."
+            )
+            expected = [name for name, selected in zip(model_names, regions) if selected == region]
+            assert [deployment["name"] for deployment in group["deployments"]] == expected
+            for deployment in group["deployments"]:
+                index = model_names.index(deployment["name"])
+                assert deployment["model"] == {
+                    "format": "Anthropic" if index == 2 else "OpenAI",
+                    "name": model_names[index], "version": model_versions[index],
+                }
+                assert deployment["capacity"] == [3, 10, 10][index]
+                assert result["routing"][output_prefixes[index]] == group["name"]
+                if index == 2:
+                    assert deployment["modelProviderData"] == {
+                        "organizationName": required["claudeOrganizationName"],
+                        "countryCode": "US", "industry": "technology",
+                    }
+                else:
+                    assert "modelProviderData" not in deployment
+                example_deployments[deployment["name"]] = deployment
+
+    inputs = {**common, **dict(zip(model_regions, ["eastus2"] * 3))}
+    declarations = "\n".join(f"var {name} = {literal(value)}" for name, value in inputs.items())
+    renamed = evaluate(directory, "foundryConfigurations",
+                       declarations.replace("'validation-a'", "'validation-b'") + "\n" + definitions)
+    assert renamed[0]["name"] != names_by_region["eastus2"], "Environments must not share accounts."
+    overridden = evaluate(
+        directory, "foundryConfigurations",
+        declarations.replace("var gpt6AstraCapacity = '10'", "var gpt6AstraCapacity = '25'") + "\n" + definitions,
+    )
+    assert [model["capacity"] for model in overridden[0]["deployments"]] == [3, 25, 10]
+    for name in defaults:
+        evaluate(directory, "foundryConfigurations",
+                 declarations.replace(f"var {name} = {literal(defaults[name])}", f"var {name} = 'invalid'") + "\n" + definitions,
+                 succeeds=False)
+
+    foundry_source = (INFRA / "foundry.bicep").read_text()
+    properties = re.search(r"^  properties: (union\(\{[\s\S]+?^  \}\))", foundry_source, re.M).group(1)
+    for name, deployment in example_deployments.items():
+        actual = evaluate(directory, properties, f"var deployment = json({literal(json.dumps(deployment))})")
+        expected = {"model": deployment["model"], "versionUpgradeOption": "NoAutoUpgrade"}
+        if name == "claude-opus-5-5":
+            expected["modelProviderData"] = deployment["modelProviderData"]
+        assert actual == expected, "Only Claude must receive Marketplace attestation."
+
+    fixture = directory / "foundry-capacity.bicepparam"
+    source = os.path.relpath(INFRA / "foundry.bicep", directory).replace(os.sep, "/")
+    for capacity in (1, 0, -1):
+        deployment = {**example_deployments[model_names[0]], "capacity": capacity}
+        model_fields = "\n".join(f"{key}: {literal(value)}" for key, value in deployment["model"].items())
+        fixture.write_text(
+            f"using {literal(source)}\n"
+            "param name = 'ai-validation'\nparam location = 'eastus2'\nparam tags = {}\n"
+            "param deployments = [{\n"
+            f"name: {literal(deployment['name'])}\nmodel: {{\n{model_fields}\n}}\n"
+            f"capacity: {capacity}\n"
+            "}]\n"
+        )
+        run("az", "bicep", "build-params", "--file", str(fixture),
+            "--outfile", str(directory / "foundry-capacity.json"), succeeds=capacity > 0)
+
+    assert "listKeys(" not in json.dumps(child)
+    assert "listKeys(" not in foundry_source
+    assert not re.search(r"\bMAI-", main_source + foundry_source, re.I)
+    assert set(child["outputs"]) == {
+        "accountName", "accountId", "projectName", "projectId",
+        "projectEndpoint", "openAiBaseUrl", "anthropicBaseUrl",
+    }
+    assert ".openai.azure.com/openai/v1/" in child["outputs"]["openAiBaseUrl"]["value"]
+    assert ".services.ai.azure.com/anthropic" in child["outputs"]["anthropicBaseUrl"]["value"]
+    assert ".services.ai.azure.com/api/projects/" in child["outputs"]["projectEndpoint"]["value"]
+    assert set(template["outputs"]["FOUNDRY_RESOURCES"]["copy"]["input"]) == {
+        "region", "accountName", "accountId", "projectName", "projectId", "projectEndpoint",
+    }
+    print("Foundry/VM region, shared/split placement, model, capacity, attestation, and output contracts passed.")
+
+
 def main():
     main_source = (INFRA / "main.bicep").read_text()
     resources_source = (INFRA / "resources.bicep").read_text()
@@ -206,7 +478,7 @@ def main():
         template = json.loads(compiled.read_text())
         resource_group = next(r for r in template["resources"] if r["type"] == "Microsoft.Resources/resourceGroups")
         assert resource_group["apiVersion"] == "2025-04-01"
-        deployment = next(r for r in template["resources"] if r["type"] == "Microsoft.Resources/deployments")
+        deployment = next(r for r in template["resources"] if r["name"] == "agent-box-resources")
         child = deployment["properties"]["template"]
         child_resources = child["resources"]
         if isinstance(child_resources, dict):
@@ -227,7 +499,7 @@ def main():
         assert template["parameters"]["adminPassword"]["type"].lower() == "securestring"
         assert "defaultValue" not in template["parameters"]["adminPassword"]
         assert child["parameters"]["adminPassword"]["type"].lower() == "securestring"
-        assert template["parameters"]["location"]["defaultValue"] == "westus2"
+        assert "defaultValue" not in template["parameters"]["location"]
         assert template["parameters"]["vmSize"]["defaultValue"] == "Standard_D64ds_v7"
         assert template["parameters"]["zone"]["defaultValue"] == "1"
         assert template["parameters"]["adminUsername"]["defaultValue"] == "azureuser"
@@ -263,6 +535,7 @@ def main():
         assert set(bindings) == set(template["parameters"])
         variables = {re.fullmatch(r"\$\{([A-Z0-9_]+)\}", p["value"]).group(1) for p in bindings.values()}
         assert variables.isdisjoint(template["outputs"]), "Outputs must not become implicit input overrides."
+        check_foundry(directory, template, main_source)
         assert bindings["osDiskSizeGb"]["value"] == "${VM_OS_DISK_SIZE_GB}"
         assert bindings["additionalRdpSources"]["value"] == "${VM_RDP_ADDITIONAL_SOURCES}"
         assert deployment["properties"]["parameters"]["osDiskSizeGb"]["value"] == "[int(parameters('osDiskSizeGb'))]"

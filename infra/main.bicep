@@ -5,9 +5,112 @@ targetScope = 'subscription'
 @maxLength(24)
 param environmentName string = 'dev'
 
-@description('Azure region. Size, image, zone, and policy compatibility must be checked when changing it.')
-@minLength(1)
+@description('VM and resource group region, independent of the model regions. Check size, image, zone, quota, and policy compatibility.')
+@allowed([
+  'eastus'
+  'eastus2'
+  'centralus'
+  'westus2'
+  'westus3'
+  'southcentralus'
+  'uksouth'
+])
 param location string
+
+@description('Required GPT-Image 2.5 Sunburst GlobalStandard deployment region. Models in the same region share a Foundry account and project.')
+@allowed([
+  'eastus2'
+  'polandcentral'
+  'swedencentral'
+  'uaenorth'
+  'westus3'
+])
+param gptImage25Region string
+
+@description('Required GPT-6 Astra GlobalStandard deployment region, independent of the VM and other models.')
+@allowed([
+  'australiaeast'
+  'brazilsouth'
+  'canadacentral'
+  'canadaeast'
+  'centralus'
+  'eastus'
+  'eastus2'
+  'francecentral'
+  'germanywestcentral'
+  'italynorth'
+  'japaneast'
+  'koreacentral'
+  'northcentralus'
+  'norwayeast'
+  'polandcentral'
+  'southafricanorth'
+  'southcentralus'
+  'southeastasia'
+  'southindia'
+  'spaincentral'
+  'swedencentral'
+  'switzerlandnorth'
+  'switzerlandwest'
+  'uaenorth'
+  'uksouth'
+  'westeurope'
+  'westus'
+  'westus3'
+])
+param gpt6AstraRegion string
+
+@description('Required Azure-hosted Claude Opus 5.5 GlobalStandard deployment region, independent of the VM and other models.')
+@allowed([
+  'centralus'
+  'eastus'
+  'eastus2'
+  'northcentralus'
+  'southcentralus'
+  'swedencentral'
+  'westcentralus'
+  'westus'
+  'westus3'
+])
+param claudeOpus55Region string
+
+@description('GPT-Image 2.5 deployment capacity units as decimal text. Requires available model quota; units differ between models.')
+@minLength(1)
+@maxLength(4)
+param gptImage25Capacity string = '3'
+
+@description('GPT-6 Astra deployment capacity units as decimal text. Requires available model quota.')
+@minLength(1)
+@maxLength(8)
+param gpt6AstraCapacity string = '10'
+
+@description('Claude Opus 5.5 deployment capacity units as decimal text. Requires available model quota.')
+@minLength(1)
+@maxLength(7)
+param claudeOpus55Capacity string = '10'
+
+@description('Legal organization name for Claude Marketplace attestation. Provisioning accepts the offer terms on your behalf; review README.md first.')
+@minLength(1)
+param claudeOrganizationName string
+
+@description('Two-letter ISO country code for the organization using Claude. Supplied to Azure Marketplace.')
+@minLength(2)
+@maxLength(2)
+param claudeCountryCode string
+
+@description('Organization industry for Claude Marketplace attestation. Must accurately describe the organization using the model.')
+@allowed([
+  'technology'
+  'finance'
+  'healthcare'
+  'education'
+  'retail'
+  'manufacturing'
+  'government'
+  'media'
+  'other'
+])
+param claudeIndustry string
 
 @description('Resource name prefix. Use letters, digits, and hyphens.')
 @minLength(1)
@@ -108,6 +211,55 @@ var rdpSources = union(empty(allowedRdpSource) ? [] : [allowedRdpSource], json(a
 var resourceTags = union(tags, {
   'azd-env-name': environmentName
 })
+var modelDeployments = [
+  {
+    region: gptImage25Region
+    deployment: {
+      name: 'gpt-image-2.5-sunburst'
+      model: {
+        format: 'OpenAI'
+        name: 'gpt-image-2.5-sunburst'
+        version: '2026-09-08'
+      }
+      capacity: int(gptImage25Capacity)
+    }
+  }
+  {
+    region: gpt6AstraRegion
+    deployment: {
+      name: 'gpt-6-astra'
+      model: {
+        format: 'OpenAI'
+        name: 'gpt-6-astra'
+        version: '2026-09-03'
+      }
+      capacity: int(gpt6AstraCapacity)
+    }
+  }
+  {
+    region: claudeOpus55Region
+    deployment: {
+      name: 'claude-opus-5-5'
+      model: {
+        format: 'Anthropic'
+        name: 'claude-opus-5-5'
+        version: '2'
+      }
+      capacity: int(claudeOpus55Capacity)
+      modelProviderData: {
+        organizationName: claudeOrganizationName
+        countryCode: toUpper(claudeCountryCode)
+        industry: claudeIndustry
+      }
+    }
+  }
+]
+var foundryRegions = union([gptImage25Region], [gpt6AstraRegion], [claudeOpus55Region])
+var foundryConfigurations = [for region in foundryRegions: {
+  name: 'ai-${uniqueString(subscription().id, resourceGroupName, region)}'
+  location: region
+  deployments: map(filter(modelDeployments, model => model.region == region), model => model.deployment)
+}]
 
 resource resourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' = {
   name: resourceGroupName
@@ -143,6 +295,17 @@ module resources './resources.bicep' = {
   }
 }
 
+module foundry './foundry.bicep' = [for configuration in foundryConfigurations: {
+  name: 'agent-box-foundry-${configuration.location}'
+  scope: resourceGroup
+  params: {
+    name: configuration.name
+    location: configuration.location
+    deployments: configuration.deployments
+    tags: resourceTags
+  }
+}]
+
 output AZURE_RESOURCE_GROUP string = resourceGroup.name
 output VM_NAME string = resources.outputs.vmName
 output VM_RESOURCE_ID string = resources.outputs.vmId
@@ -153,3 +316,17 @@ output VM_RDP_ENABLED bool = !empty(rdpSources)
 output ENROLLMENT_SCRIPT_PATH string = resources.outputs.enrollmentScriptPath
 output DEV_TOOLS_SCRIPT_PATH string = resources.outputs.devToolsScriptPath
 output DEV_TOOLS_TASK_PATH string = resources.outputs.devToolsTaskPath
+output FOUNDRY_RESOURCES array = [for (region, index) in foundryRegions: {
+  region: region
+  accountName: foundry[index].outputs.accountName
+  accountId: foundry[index].outputs.accountId
+  projectName: foundry[index].outputs.projectName
+  projectId: foundry[index].outputs.projectId
+  projectEndpoint: foundry[index].outputs.projectEndpoint
+}]
+output GPT_IMAGE_25_BASE_URL string = foundry[indexOf(foundryRegions, gptImage25Region)].outputs.openAiBaseUrl
+output GPT_IMAGE_25_DEPLOYMENT_NAME string = modelDeployments[0].deployment.name
+output GPT_6_ASTRA_BASE_URL string = foundry[indexOf(foundryRegions, gpt6AstraRegion)].outputs.openAiBaseUrl
+output GPT_6_ASTRA_DEPLOYMENT_NAME string = modelDeployments[1].deployment.name
+output CLAUDE_OPUS_55_BASE_URL string = foundry[indexOf(foundryRegions, claudeOpus55Region)].outputs.anthropicBaseUrl
+output CLAUDE_OPUS_55_DEPLOYMENT_NAME string = modelDeployments[2].deployment.name
