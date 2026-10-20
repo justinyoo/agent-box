@@ -79,32 +79,32 @@ For automation, inject the password from a secret store into the azd process. **
 
 Use `azd env set NAME VALUE` to override settings and `azd env unset NAME` to restore optional defaults. Full constraints are in [infra/main.bicep](infra/main.bicep).
 
-| Variable                       | Default / meaning                                                                                                                |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| `AZURE_ENV_NAME`               | Set by `azd env new`                                                                                                             |
-| `AZURE_LOCATION`               | Set by `azd up` or `azd provision`; choose `eastus`, `eastus2`, `centralus`, `westus2`, `westus3`, `southcentralus` or `uksouth` |
-| `VM_NAME_PREFIX`               | `agentbox`                                                                                                                       |
-| `VM_NAME_OVERRIDE`             | Environment-derived VM name                                                                                                      |
-| `VM_COMPUTER_NAME_OVERRIDE`    | Environment-derived Windows name; maximum 15 characters                                                                          |
-| `VM_SIZE`                      | `Standard_D64ds_v7`                                                                                                              |
-| `VM_ZONE`                      | `1`; empty means regional                                                                                                        |
-| `VM_IMAGE_PUBLISHER`           | `microsoftwindowsdesktop`                                                                                                        |
-| `VM_IMAGE_OFFER`               | `windows-11`                                                                                                                     |
-| `VM_IMAGE_SKU`                 | `win11-26h2-ent`, single-session                                                                                                 |
-| `VM_IMAGE_VERSION`             | `latest`; accepts a published version                                                                                            |
-| `VM_ADMIN_USERNAME`            | `azureuser`                                                                                                                      |
-| `VM_ENROLLMENT_ADMIN_USERNAME` | `enrolleduser`; must differ from the initial account                                                                             |
-| `VM_ADMIN_PASSWORD`            | Required secure input                                                                                                            |
-| `VM_OS_DISK_SIZE_GB`           | `127`; range 127-4095                                                                                                            |
-| `VM_OS_DISK_TYPE`              | `Premium_LRS`; also `StandardSSD_LRS` or `Standard_LRS`                                                                          |
-| `VM_DISK_CONTROLLER`           | `NVMe`; also `SCSI` when compatible                                                                                              |
-| `VM_ACCELERATED_NETWORKING`    | `true`; accepts `false`                                                                                                          |
-| `VM_VNET_PREFIX`               | `172.16.0.0/16`                                                                                                                  |
-| `VM_SUBNET_PREFIX`             | `172.16.0.0/24`; must fit within the VNet                                                                                        |
+| Variable                       | Default / meaning                                                                                                |
+| ------------------------------ | -----------------------------------------------------------------------------------------------------------------|
+| `AZURE_ENV_NAME`               | Set by `azd env new`                                                                                             |
+| `AZURE_LOCATION`               | Set by `azd up` or `azd provision`; recommend `eastus2`` or `westus3`                                            |
+| `VM_NAME_PREFIX`               | `agentbox`                                                                                                       |
+| `VM_NAME_OVERRIDE`             | Environment-derived VM name                                                                                      |
+| `VM_COMPUTER_NAME_OVERRIDE`    | Environment-derived Windows name; maximum 15 characters                                                          |
+| `VM_SIZE`                      | `Standard_D64ds_v7`                                                                                              |
+| `VM_ZONE`                      | `1`; empty means regional                                                                                        |
+| `VM_IMAGE_PUBLISHER`           | `microsoftwindowsdesktop`                                                                                        |
+| `VM_IMAGE_OFFER`               | `windows-11`                                                                                                     |
+| `VM_IMAGE_SKU`                 | `win11-26h2-ent`, single-session                                                                                 |
+| `VM_IMAGE_VERSION`             | `latest`; accepts a published version                                                                            |
+| `VM_ADMIN_USERNAME`            | `azureuser`                                                                                                      |
+| `VM_ENROLLMENT_ADMIN_USERNAME` | `enrolleduser`; must differ from the initial account                                                             |
+| `VM_ADMIN_PASSWORD`            | Required secure input                                                                                            |
+| `VM_OS_DISK_SIZE_GB`           | `127`; range 127-4095                                                                                            |
+| `VM_OS_DISK_TYPE`              | `Premium_LRS`; also `StandardSSD_LRS` or `Standard_LRS`                                                          |
+| `VM_DISK_CONTROLLER`           | `NVMe`; also `SCSI` when compatible                                                                              |
+| `VM_ACCELERATED_NETWORKING`    | `true`; accepts `false`                                                                                          |
+| `VM_VNET_PREFIX`               | `172.16.0.0/16`                                                                                                  |
+| `VM_SUBNET_PREFIX`             | `172.16.0.0/24`; must fit within the VNet                                                                        |
 | `VM_RDP_SOURCE`                | Refreshed by the preprovision hook to the current public IPv4 `/32`; merged with additional sources for TCP 3389 |
-| `VM_RDP_ADDITIONAL_SOURCES`    | `[]`; JSON array of retained trusted IPv4 addresses/CIDRs, maintained by the RDP append scripts |
-| `VM_PYTHON_VERSION`            | `3.14`; a Python minor version                                                                                                   |
-| `VM_TAGS`                      | `{}`; the azd environment tag takes precedence                                                                                   |
+| `VM_RDP_ADDITIONAL_SOURCES`    | `[]`; JSON array of retained trusted IPv4 addresses/CIDRs, maintained by the RDP append scripts                  |
+| `VM_PYTHON_VERSION`            | `3.14`; a Python minor version                                                                                   |
+| `VM_TAGS`                      | `{}`; the azd environment tag takes precedence                                                                   |
 
 Check compatibility when changing the region, size, zone, image, disk controller, or accelerated networking. Image `latest` applies to new VMs, not OS upgrades. `VM_NAME` and `VM_COMPUTER_NAME` are outputs; use the `_OVERRIDE` variables for inputs.
 
@@ -169,7 +169,9 @@ For the Copilot app, add the compatible Foundry/model provider in **Settings > M
 2. Sign in locally as `enrolleduser` with the same initial password. The elevated `\AgentBox\InstallDevTools` task starts automatically.
 3. Wait for setup to finish, then open a new terminal. Provisioning registers the task; it does not wait for this future sign-in.
 
-WinGet installs **PowerShell 7, Git, NVM for Windows, uv, Azure CLI, azd, gh, GitHub Copilot CLI, and GitHub Copilot app**. NVM is user-scoped; the other tools are machine-wide. Existing tool versions are retained.
+WinGet installs **PowerShell 7, Git, uv, Azure CLI, azd, gh, GitHub Copilot CLI, and GitHub Copilot app** machine-wide. Existing tool versions are retained.
+
+**NVM for Windows** is installed separately from the [latest stable GitHub release of `nvm-windows/nvm`](https://github.com/nvm-windows/nvm/releases/latest), not from WinGet. On a fresh installation, the script resolves GitHub's latest non-draft, non-prerelease release at runtime, selects its x64 setup executable, verifies its SHA-256 digest and Authenticode signature, and installs it silently for the signed-in user. No NVM release version is pinned. An existing NVM installation is verified and retained rather than automatically upgraded. Setup preserves any standalone Node.js installation and does not restart Windows automatically.
 
 NVM installs and activates the latest **64-bit Node.js LTS**. uv installs the latest **Python 3.14** patch known to its catalog, without replacing unrelated Python defaults. Azure/GitHub authentication and Copilot onboarding remain manual.
 

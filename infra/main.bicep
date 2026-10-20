@@ -6,18 +6,28 @@ targetScope = 'subscription'
 param environmentName string = 'dev'
 
 @description('VM and resource group region, independent of the model regions. Check size, image, zone, quota, and policy compatibility.')
+@metadata({
+  azd: {
+    type: 'location'
+  }
+})
 @allowed([
+  'centralus'
   'eastus'
   'eastus2'
-  'centralus'
-  'westus2'
-  'westus3'
   'southcentralus'
   'uksouth'
+  'westus2'
+  'westus3'
 ])
 param location string
 
 @description('Required GPT-Image 2.5 Sunburst GlobalStandard deployment region. Models in the same region share a Foundry account and project.')
+@metadata({
+  azd: {
+    type: 'location'
+  }
+})
 @allowed([
   'eastus2'
   'polandcentral'
@@ -28,6 +38,11 @@ param location string
 param gptImage25Region string
 
 @description('Required GPT-6 Astra GlobalStandard deployment region, independent of the VM and other models.')
+@metadata({
+  azd: {
+    type: 'location'
+  }
+})
 @allowed([
   'australiaeast'
   'brazilsouth'
@@ -61,6 +76,11 @@ param gptImage25Region string
 param gpt6AstraRegion string
 
 @description('Required Azure-hosted Claude Opus 5.5 GlobalStandard deployment region, independent of the VM and other models.')
+@metadata({
+  azd: {
+    type: 'location'
+  }
+})
 @allowed([
   'centralus'
   'eastus'

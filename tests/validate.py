@@ -194,7 +194,7 @@ def check_rdp_allowlist(directory, main_source, resources_source):
 def check_foundry(directory, template, main_source):
     expected_regions = {
         "location": [
-            "eastus", "eastus2", "centralus", "westus2", "westus3", "southcentralus", "uksouth",
+            "centralus", "eastus", "eastus2", "southcentralus", "uksouth", "westus2", "westus3",
         ],
         "gptImage25Region": [
             "eastus2", "polandcentral", "swedencentral", "uaenorth", "westus3",
@@ -216,12 +216,18 @@ def check_foundry(directory, template, main_source):
     for name, regions in expected_regions.items():
         parameter = template["parameters"][name]
         assert "defaultValue" not in parameter, f"{name} must prompt when unset."
+        assert parameter["metadata"]["azd"] == {"type": "location"}, (
+            f"{name} must use the azd location picker without a template-specified default."
+        )
         assert parameter["allowedValues"] == regions, f"Wrong region allowlist for {name}."
         row_name = "AZURE_LOCATION" if name == "location" else name
         row = next(line for line in readme.splitlines() if line.startswith(f"| `{row_name}`"))
-        region_text = row.split("choose ", 1)[1] if name == "location" else row.split("|")[3]
-        documented = re.findall(r"`([^`]+)`", region_text)
-        assert set(documented) == set(regions), f"README regions drifted for {name}."
+        if name == "location":
+            recommended = re.findall(r"`([a-z]+[0-9]*)`", row.split("|")[2])
+            assert recommended and set(recommended) <= set(regions), "README recommends an unsupported VM region."
+        else:
+            documented = re.findall(r"`([^`]+)`", row.split("|")[3])
+            assert set(documented) == set(regions), f"README regions drifted for {name}."
 
     bindings = json.loads((INFRA / "main.parameters.json").read_text())["parameters"]
     expected_bindings = {
