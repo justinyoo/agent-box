@@ -8,6 +8,33 @@
     "location": {
       "value": "${AZURE_LOCATION}"
     },
+    "gptImage25Region": {
+      "value": "${GPT_IMAGE_25_REGION}"
+    },
+    "gpt6AstraRegion": {
+      "value": "${GPT_6_ASTRA_REGION}"
+    },
+    "claudeOpus55Region": {
+      "value": "${CLAUDE_OPUS_55_REGION}"
+    },
+    "gptImage25Capacity": {
+      "value": "${GPT_IMAGE_25_CAPACITY}"
+    },
+    "gpt6AstraCapacity": {
+      "value": "${GPT_6_ASTRA_CAPACITY}"
+    },
+    "claudeOpus55Capacity": {
+      "value": "${CLAUDE_OPUS_55_CAPACITY}"
+    },
+    "claudeOrganizationName": {
+      "value": "${CLAUDE_ORGANIZATION_NAME}"
+    },
+    "claudeCountryCode": {
+      "value": "${CLAUDE_COUNTRY_CODE}"
+    },
+    "claudeIndustry": {
+      "value": "${CLAUDE_INDUSTRY}"
+    },
     "namePrefix": {
       "value": "${VM_NAME_PREFIX}"
     },

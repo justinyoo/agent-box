@@ -5,5 +5,6 @@
 *.local.parameters.json
 infra/main.json
 infra/resources.json
+infra/foundry.json
 *.log
 __pycache__/

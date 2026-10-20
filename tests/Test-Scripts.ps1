@@ -34,6 +34,22 @@ function Test-Case([string]$Name, [scriptblock]$Action) {
 function Get-TestUser {
     [pscustomobject]@{ Name = 'enrolleduser'; Enabled = $true; SID = [pscustomobject]@{ Value = 'S-1-5-21-1-2-3-1001' } }
 }
+function Get-TestNvmRelease {
+    param([string]$Version = '2.7.3')
+
+    [pscustomobject]@{
+        tag_name = "v$Version"; draft = $false; prerelease = $false
+        assets = @(
+            [pscustomobject]@{ name = "nvm-$Version-arm64-setup.exe" }
+            [pscustomobject]@{ name = "nvm-$Version-x64-sync.exe" }
+            [pscustomobject]@{
+                name = "nvm-$Version-x64-setup.exe"
+                browser_download_url = "https://github.com/nvm-windows/nvm/releases/download/v$Version/nvm-$Version-x64-setup.exe"
+                digest = 'sha256:' + ('a' * 64)
+            }
+        )
+    }
+}
 
 Test-Case 'new secondary administrator is added by identity, not an ambiguous name' {
     $script:user = $null
@@ -231,7 +247,229 @@ Test-Case 'LTS resolution ignores a newer non-LTS release and does not depend on
     }
     Assert-True ((Get-LatestNodeLts).Version -eq '24.22.0') 'Wrong LTS selected.'
 }
-Test-Case 'WinGet scopes and installer architectures remain explicit for all nine packages' {
+Test-Case 'NVM resolves the latest stable x64 installer without pinning a release version' {
+    function Invoke-RestMethod { param($Uri, $Headers, $UserAgent, $TimeoutSec, $ErrorAction)
+        Assert-True ($Uri -ceq 'https://api.github.com/repos/nvm-windows/nvm/releases/latest') 'Wrong release source.'
+        Assert-True ($Headers.Accept -eq 'application/vnd.github+json') 'Missing GitHub response format.'
+        Assert-True ($Headers['X-GitHub-Api-Version'] -eq '2022-11-28') 'Missing GitHub API version.'
+        Assert-True ($UserAgent -eq 'AgentBox-DevTools' -and $TimeoutSec -eq 60 -and $ErrorAction -eq 'Stop') 'Unsafe release lookup.'
+        return $script:nvmRelease
+    }
+    foreach ($version in @('2.7.3', '3.1.0')) {
+        $script:nvmRelease = Get-TestNvmRelease -Version $version
+        $result = Get-LatestNvmRelease
+        Assert-True ($result.Version -eq $version) 'NVM release version was pinned.'
+        Assert-True ($result.DownloadUrl -eq $script:nvmRelease.assets[2].browser_download_url) 'Wrong architecture or setup asset.'
+        Assert-True ($result.Sha256 -ceq ('a' * 64)) 'SHA-256 was not read from release metadata.'
+    }
+}
+Test-Case 'NVM rejects draft, prerelease, and malformed release metadata' {
+    function Invoke-RestMethod { return $script:nvmRelease }
+    foreach ($invalid in @('draft', 'prerelease', 'missing-flag', 'string-flag', 'bad-version', 'null')) {
+        $script:nvmRelease = Get-TestNvmRelease
+        switch ($invalid) {
+            'draft' { $script:nvmRelease.draft = $true }
+            'prerelease' { $script:nvmRelease.prerelease = $true }
+            'missing-flag' { $script:nvmRelease.PSObject.Properties.Remove('prerelease') }
+            'string-flag' { $script:nvmRelease.draft = 'false' }
+            'bad-version' { $script:nvmRelease.tag_name = '../invalid' }
+            'null' { $script:nvmRelease = $null }
+        }
+        Assert-Throws { Get-LatestNvmRelease } '*valid stable NVM release metadata*'
+    }
+}
+Test-Case 'NVM rejects missing or ambiguous installers and untrusted asset metadata' {
+    function Invoke-RestMethod { return $script:nvmRelease }
+    foreach ($invalid in @('missing', 'duplicate', 'wrong-version')) {
+        $script:nvmRelease = Get-TestNvmRelease
+        switch ($invalid) {
+            'missing' { $script:nvmRelease.assets = $script:nvmRelease.assets[0..1] }
+            'duplicate' { $script:nvmRelease.assets += $script:nvmRelease.assets[2] }
+            'wrong-version' { $script:nvmRelease.assets[2].name = 'nvm-2.7.4-x64-setup.exe' }
+        }
+        Assert-Throws { Get-LatestNvmRelease } '*exactly one*release asset*'
+    }
+    foreach ($invalid in @('http', 'wrong-repository', 'missing-digest', 'bad-digest')) {
+        $script:nvmRelease = Get-TestNvmRelease
+        $asset = $script:nvmRelease.assets[2]
+        switch ($invalid) {
+            'http' { $asset.browser_download_url = $asset.browser_download_url.Replace('https:', 'http:') }
+            'wrong-repository' { $asset.browser_download_url = $asset.browser_download_url.Replace('/nvm-windows/', '/untrusted/') }
+            'missing-digest' { $asset.PSObject.Properties.Remove('digest') }
+            'bad-digest' { $asset.digest = 'sha256:invalid' }
+        }
+        Assert-Throws { Get-LatestNvmRelease } '*invalid installer URL or SHA-256 digest*'
+    }
+}
+Test-Case 'NVM version parsing supports retained v1 installs and v2 edition notices' {
+    function Invoke-ToolCommand { param($CommandName, $Arguments, $LogDirectory)
+        Assert-True ($CommandName -eq 'nvm.exe' -and ($Arguments -join ' ') -eq 'version') 'Wrong version probe.'
+        return $script:nvmOutput
+    }
+    foreach ($version in @('1.2.2', '2.7.3', '3.1.0-beta.1')) {
+        $script:nvmOutput = if ($version.StartsWith('1.')) { $version } else { "v$version`r`nCommunity Edition" }
+        Assert-True ((Get-NvmVersion -LogDirectory unused) -eq $version) 'NVM version was parsed incorrectly.'
+    }
+    $script:nvmOutput = 'unexpected output'
+    Assert-Throws { Get-NvmVersion -LogDirectory unused } '*recognizable version*'
+}
+Test-Case 'NVM installs once with verified bytes, user scope, no reboot, and temporary-file cleanup' {
+    $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('agentbox-nvm-test-' + [guid]::NewGuid().ToString('N'))
+    $originalTls = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        $logs = Join-Path $testRoot 'logs with spaces'
+        $null = New-Item -ItemType Directory -Path $logs
+        $script:nvmPayload = Join-Path $testRoot 'payload.bin'
+        [IO.File]::WriteAllText($script:nvmPayload, 'Synthetic installer bytes; never executable.')
+        $script:nvmRelease = Get-TestNvmRelease
+        $script:nvmRelease.assets[2].digest = 'sha256:' + (Get-FileHash -LiteralPath $script:nvmPayload -Algorithm SHA256).Hash
+        $script:nvmInstalled = $false
+        $script:nvmInstalledVersion = '2.7.3'
+        $script:nvmLookups = 0
+        $script:nvmDownloads = 0
+        $script:nvmSignatures = 0
+        $script:nvmLaunches = 0
+        function Update-ProcessPath {}
+        function Get-Command { param($Name, $CommandType, $ErrorAction)
+            Assert-True ($Name -eq 'nvm.exe' -and $CommandType -eq 'Application') 'Unexpected executable lookup.'
+            if ($script:nvmInstalled) { [pscustomobject]@{ Source = 'nvm.exe' } }
+        }
+        function Invoke-RestMethod { $script:nvmLookups++; return $script:nvmRelease }
+        function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing, $UserAgent, $TimeoutSec, $ErrorAction)
+            Assert-True ($Uri -eq $script:nvmRelease.assets[2].browser_download_url) 'Wrong download URL.'
+            Assert-True ($UseBasicParsing -and $TimeoutSec -eq 180 -and $ErrorAction -eq 'Stop') 'Unsafe download options.'
+            $script:nvmDownloads++
+            Copy-Item -LiteralPath $script:nvmPayload -Destination $OutFile
+        }
+        function Get-AuthenticodeSignature { param($LiteralPath, $ErrorAction)
+            Assert-True (Test-Path -LiteralPath $LiteralPath -PathType Leaf) 'Installer was not downloaded.'
+            $script:nvmSignatures++
+            [pscustomobject]@{ Status = 'Valid' }
+        }
+        function Invoke-LoggedProcess { param($Executable, $Arguments, $LogDirectory)
+            Assert-True ($script:nvmSignatures -eq 1) 'Installer ran before signature verification.'
+            foreach ($argument in @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/SP-', '/CURRENTUSER',
+                '/NORESTART', '/RESTARTEXITCODE=3010', '/NOCLOSEAPPLICATIONS', '/OFFICIALNODE=ignore')) {
+                Assert-True ($Arguments -contains $argument) "Missing safe setup argument $argument."
+            }
+            $log = Join-Path $LogDirectory 'nvm-setup.log'
+            Assert-True ($Arguments -contains ('/LOG="{0}"' -f $log)) 'Installer log path was not quoted.'
+            [IO.File]::WriteAllText($log, 'Synthetic setup log.')
+            $script:nvmLaunches++
+            $script:nvmInstalled = $true
+            [pscustomobject]@{ ExitCode = [uint32]0; StandardOutput = '' }
+        }
+        function Invoke-ToolCommand { param($CommandName, $Arguments, $LogDirectory)
+            Assert-True ($script:nvmInstalled) 'NVM was not installed before verification.'
+            return "v$script:nvmInstalledVersion`nCommunity Edition"
+        }
+        Install-NvmForWindows -LogDirectory $logs
+        Install-NvmForWindows -LogDirectory $logs
+        $script:nvmInstalledVersion = '1.2.2'
+        Install-NvmForWindows -LogDirectory $logs
+        Assert-True ($script:nvmLookups -eq 1 -and $script:nvmDownloads -eq 1 -and $script:nvmLaunches -eq 1) 'Existing NVM was reinstalled or upgraded.'
+        Assert-True (@(Get-ChildItem -LiteralPath $logs -Filter *.exe).Count -eq 0) 'Downloaded installer was retained.'
+        Assert-True (Test-Path -LiteralPath (Join-Path $logs 'nvm-setup.log')) 'Installer log was removed.'
+        Assert-True ([Net.ServicePointManager]::SecurityProtocol -eq $originalTls) 'TLS settings were not restored.'
+    }
+    finally {
+        if ([IO.Directory]::Exists($testRoot)) { [IO.Directory]::Delete($testRoot, $true) }
+    }
+}
+Test-Case 'NVM fails closed on network, integrity, installer, restart, and verification errors' {
+    $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('agentbox-nvm-failure-' + [guid]::NewGuid().ToString('N'))
+    $originalTls = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        $null = New-Item -ItemType Directory -Path $testRoot
+        $script:nvmPayload = Join-Path $testRoot 'payload.bin'
+        [IO.File]::WriteAllText($script:nvmPayload, 'Synthetic installer bytes; never executable.')
+        function Update-ProcessPath {}
+        function Get-Command {}
+        function Invoke-RestMethod {
+            if ($script:nvmFailure -eq 'network') { throw 'Synthetic GitHub API failure.' }
+            return $script:nvmRelease
+        }
+        function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing, $UserAgent, $TimeoutSec, $ErrorAction)
+            Copy-Item -LiteralPath $script:nvmPayload -Destination $OutFile
+            if ($script:nvmFailure -eq 'download') { throw 'Synthetic download failure.' }
+            if ($script:nvmFailure -eq 'hash') { [IO.File]::WriteAllText($OutFile, 'Corrupt payload.') }
+        }
+        function Get-AuthenticodeSignature {
+            [pscustomobject]@{ Status = $(if ($script:nvmFailure -eq 'signature') { 'NotSigned' } else { 'Valid' }) }
+        }
+        function Invoke-LoggedProcess {
+            $script:nvmLaunches++
+            $code = switch ($script:nvmFailure) { 'installer' { 13 }; 'restart' { 3010 }; default { 0 } }
+            [pscustomobject]@{ ExitCode = [uint32]$code; StandardOutput = '' }
+        }
+        function Invoke-ToolCommand {
+            if ($script:nvmFailure -eq 'missing-command') { throw 'Synthetic missing nvm.exe on PATH.' }
+            return 'v2.7.2'
+        }
+        foreach ($case in @(
+            @{ Name = 'network'; Pattern = '*GitHub API failure*'; Launches = 0 }
+            @{ Name = 'download'; Pattern = '*download failure*'; Launches = 0 }
+            @{ Name = 'hash'; Pattern = '*SHA-256 does not match*'; Launches = 0 }
+            @{ Name = 'signature'; Pattern = '*signature is not valid*'; Launches = 0 }
+            @{ Name = 'installer'; Pattern = '*installation failed*'; Launches = 1 }
+            @{ Name = 'restart'; Pattern = '*requires a restart*'; Launches = 1 }
+            @{ Name = 'wrong-version'; Pattern = '*instead of 2.7.3*'; Launches = 1 }
+            @{ Name = 'missing-command'; Pattern = '*missing nvm.exe*'; Launches = 1 }
+        )) {
+            $script:nvmRelease = Get-TestNvmRelease
+            $script:nvmRelease.assets[2].digest = 'sha256:' + (Get-FileHash -LiteralPath $script:nvmPayload -Algorithm SHA256).Hash
+            $script:nvmFailure = $case.Name
+            $script:nvmLaunches = 0
+            Assert-Throws { Install-NvmForWindows -LogDirectory $testRoot } $case.Pattern
+            Assert-True ($script:nvmLaunches -eq $case.Launches) "Wrong installer execution for $($case.Name)."
+            Assert-True (@(Get-ChildItem -LiteralPath $testRoot -Filter *.exe).Count -eq 0) 'Failed installer download was retained.'
+            Assert-True ([Net.ServicePointManager]::SecurityProtocol -eq $originalTls) 'Failed install changed TLS settings.'
+        }
+    }
+    finally {
+        if ([IO.Directory]::Exists($testRoot)) { [IO.Directory]::Delete($testRoot, $true) }
+    }
+}
+Test-Case 'Node LTS setup handles NVM v1 and v2 arguments and rejects an incorrect active architecture' {
+    function Get-LatestNodeLts { [pscustomobject]@{ Version = '24.22.0'; Lts = 'Current' } }
+    function Update-ProcessPath {}
+    function Test-Path { param($LiteralPath, $PathType) return $LiteralPath -eq 'managed-python.exe' }
+    function Invoke-ToolCommand { param($CommandName, $Arguments, $LogDirectory)
+        switch ($CommandName) {
+            'nvm.exe' {
+                if ($Arguments[0] -eq 'version') { return "v$script:runtimeNvmVersion" }
+                $expected = if ($script:runtimeNvmVersion.StartsWith('1.')) { '24.22.0 64' } else { '24.22.0' }
+                Assert-True (($Arguments -join ' ') -eq "$($Arguments[0]) $expected") 'Incorrect NVM architecture argument.'
+                $script:runtimeCalls.Add($Arguments[0])
+                return ''
+            }
+            'node.exe' { return (@{ version = '24.22.0'; lts = 'Current'; arch = $script:runtimeArch } | ConvertTo-Json -Compress) }
+            'npm' {
+                Assert-True (($Arguments -join ' ') -eq '--version') 'Wrong npm probe.'
+                $script:runtimeCalls.Add('npm')
+                return '10.9.0'
+            }
+            'uv.exe' {
+                if ($Arguments[1] -eq 'find') { return 'managed-python.exe' }
+                Assert-True (($Arguments -join ' ') -eq 'python install 3.14 --upgrade --no-config --no-progress') 'Python installation changed.'
+                return ''
+            }
+            'managed-python.exe' { return 'Python 3.14.8' }
+            default { throw "Unexpected tool: $CommandName." }
+        }
+    }
+    foreach ($version in @('1.2.2', '2.7.3')) {
+        $script:runtimeNvmVersion = $version
+        $script:runtimeArch = 'x64'
+        $script:runtimeCalls = [Collections.Generic.List[string]]::new()
+        Install-LanguageRuntimes -PythonVersion 3.14 -LogDirectory unused
+        Assert-True (($script:runtimeCalls -join ',') -eq 'install,use,npm') 'Node installation/activation/probe ordering changed.'
+    }
+    $script:runtimeArch = 'x86'
+    Assert-Throws { Install-LanguageRuntimes -PythonVersion 3.14 -LogDirectory unused } '*does not match LTS*for x64*'
+}
+
+Test-Case 'WinGet scopes and installer architectures remain explicit for all eight packages' {
     $script:installed = @{}
     $script:installs = [Collections.Generic.List[object]]::new()
     function Invoke-WinGetCommand { param($Executable, $Arguments, $LogDirectory)
@@ -250,14 +488,10 @@ Test-Case 'WinGet scopes and installer architectures remain explicit for all nin
     }
     Install-DevToolPackages -WinGetExecutable winget.exe -LogDirectory unused
     Install-DevToolPackages -WinGetExecutable winget.exe -LogDirectory unused
-    Assert-True ($script:installs.Count -eq 9) 'Missing packages or repeated installs.'
+    Assert-True ($script:installs.Count -eq 8) 'Missing packages or repeated installs.'
     foreach ($installation in $script:installs) {
-        if ($installation.Id -eq 'CoreyButler.NVMforWindows') {
-            Assert-True ($installation.Scope -eq 'user' -and $installation.Architecture -eq 'x86') 'NVM scope changed.'
-        }
-        else {
-            Assert-True ($installation.Scope -eq 'machine' -and $installation.Architecture -eq 'x64') 'Machine package scope changed.'
-        }
+        Assert-True ($installation.Id -ne 'CoreyButler.NVMforWindows') 'NVM must not be installed through WinGet.'
+        Assert-True ($installation.Scope -eq 'machine' -and $installation.Architecture -eq 'x64') 'Machine package scope changed.'
     }
 }
 

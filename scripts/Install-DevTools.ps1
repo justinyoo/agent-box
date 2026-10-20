@@ -2,22 +2,24 @@
 
 <#
 .SYNOPSIS
-Installs Agent Box tools with WinGet and runtimes with NVM and uv.
+Installs Agent Box tools with WinGet and GitHub releases, and runtimes with NVM and uv.
 .DESCRIPTION
 Run in an elevated Windows x64 user session, not as SYSTEM. Windows PowerShell
 5.1 is supported so that PowerShell 7 does not need to be installed beforehand.
 If necessary, bootstraps WinGet using Microsoft's Microsoft.WinGet.Client module.
 
 Installs PowerShell 7, Git, NVM for Windows, uv, Azure CLI, Azure Developer CLI,
-GitHub CLI, GitHub Copilot CLI, and the GitHub Copilot app. NVM uses its
-user-scoped x86 installer; run as the intended account (enrolleduser in the
-planned sign-in task). The other tools are installed machine-wide.
-Existing tool versions in the requested scope are retained; missing packages
-use the latest stable version in the WinGet catalog. Installs and activates
+GitHub CLI, GitHub Copilot CLI, and the GitHub Copilot app. Missing NVM is
+installed from the latest stable nvm-windows/nvm GitHub release using its
+user-scoped x64 installer, after SHA-256 and Authenticode verification. Run as
+the intended account (enrolleduser in the planned sign-in task).
+Existing NVM installations are retained; other missing tools use the latest
+stable version in the WinGet catalog and are installed machine-wide.
+Existing tool versions in the requested scope are retained. Installs and activates
 the latest Node.js LTS release through NVM, and installs/upgrades Python to the
 latest patch of the requested minor version available to uv. Existing runtime
 versions are not removed. Unversioned Python aliases are not overwritten.
-Package and source agreements are accepted noninteractively.
+Package, installer, and source agreements are accepted noninteractively.
 WinGet may select MSI installers internally; this script never invokes them
 directly. It does not authenticate tools or allow automatic reboots.
 .PARAMETER DisableFirstSignInTask
@@ -37,6 +39,8 @@ pwsh.exe -NoProfile -File ./Install-DevTools.ps1 -PythonVersion 3.15
 https://learn.microsoft.com/windows/package-manager/winget/
 .LINK
 https://learn.microsoft.com/windows/package-manager/winget/install
+.LINK
+https://github.com/nvm-windows/nvm/releases/latest
 .LINK
 https://docs.astral.sh/uv/concepts/python-versions/
 #>
@@ -196,7 +200,6 @@ function Install-DevToolPackages {
     $packageIds = @(
         'Microsoft.PowerShell'
         'Git.Git'
-        'CoreyButler.NVMforWindows'
         'astral-sh.uv'
         'Microsoft.AzureCLI'
         'Microsoft.Azd'
@@ -211,8 +214,8 @@ function Install-DevToolPackages {
         ForEach-Object { [Convert]::ToUInt32($_, 16) }
 
     foreach ($id in $packageIds) {
-        $scope = if ($id -eq 'CoreyButler.NVMforWindows') { 'user' } else { 'machine' }
-        $architecture = if ($id -eq 'CoreyButler.NVMforWindows') { 'x86' } else { 'x64' }
+        $scope = 'machine'
+        $architecture = 'x64'
         $query = @(
             'list', '--id', $id, '--exact', '--source', 'winget', '--scope', $scope,
             '--accept-source-agreements', '--disable-interactivity'
@@ -252,6 +255,108 @@ function Install-DevToolPackages {
             throw ('{0} was not verified in {1} scope (0x{2:X8}). See {3}.' -f $id, $scope, $code, $LogDirectory)
         }
         Write-Host "$id is installed (scope: $scope)."
+    }
+}
+
+function Get-NvmVersion {
+    param([string]$LogDirectory)
+
+    $output = Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments @('version') `
+        -LogDirectory $LogDirectory
+    # NVM 2 prefixes the version with "v" and can append an edition notice.
+    if ($output -notmatch '^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\r?\n|$)') {
+        throw "NVM did not report a recognizable version. See $LogDirectory."
+    }
+    return $Matches[1]
+}
+
+function Get-LatestNvmRelease {
+    $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/nvm-windows/nvm/releases/latest' `
+        -Headers @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } `
+        -UserAgent 'AgentBox-DevTools' -TimeoutSec 60 -ErrorAction Stop
+    if ($null -eq $release -or
+        -not $release.PSObject.Properties['draft'] -or
+        -not $release.PSObject.Properties['prerelease'] -or
+        -not $release.PSObject.Properties['tag_name'] -or
+        -not $release.PSObject.Properties['assets'] -or
+        $release.draft -isnot [bool] -or $release.prerelease -isnot [bool] -or
+        $release.draft -or $release.prerelease -or
+        $release.tag_name -notmatch '^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$') {
+        throw 'GitHub did not return valid stable NVM release metadata.'
+    }
+    $version = $Matches[1]
+    $assetName = "nvm-$version-x64-setup.exe"
+    $assets = @($release.assets | Where-Object {
+        $_.PSObject.Properties['name'] -and $_.name -ceq $assetName
+    })
+    if ($assets.Count -ne 1) {
+        throw "NVM $version must have exactly one $assetName release asset."
+    }
+    $asset = $assets[0]
+    $expectedUrl = "https://github.com/nvm-windows/nvm/releases/download/$($release.tag_name)/$assetName"
+    if (-not $asset.PSObject.Properties['browser_download_url'] -or
+        $asset.browser_download_url -cne $expectedUrl -or
+        -not $asset.PSObject.Properties['digest'] -or
+        $asset.digest -notmatch '^sha256:([a-fA-F0-9]{64})$') {
+        throw "NVM $version has an invalid installer URL or SHA-256 digest."
+    }
+    return [pscustomobject]@{
+        Version = $version
+        DownloadUrl = $expectedUrl
+        Sha256 = $Matches[1]
+    }
+}
+
+function Install-NvmForWindows {
+    param([string]$LogDirectory)
+
+    Update-ProcessPath
+    $existing = Get-Command nvm.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -ne $existing) {
+        $version = Get-NvmVersion -LogDirectory $LogDirectory
+        Write-Host "NVM $version is already available; keeping its current version."
+        return
+    }
+
+    $installer = Join-Path $LogDirectory ('nvm-setup-{0}.exe' -f [guid]::NewGuid().ToString('N'))
+    $originalTls = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = $originalTls -bor [Net.SecurityProtocolType]::Tls12
+        $release = Get-LatestNvmRelease
+        Write-Host "Installing NVM $($release.Version) from $($release.DownloadUrl)."
+        Invoke-WebRequest -Uri $release.DownloadUrl -OutFile $installer -UseBasicParsing `
+            -UserAgent 'AgentBox-DevTools' -TimeoutSec 180 -ErrorAction Stop | Out-Null
+        $hash = Get-FileHash -LiteralPath $installer -Algorithm SHA256 -ErrorAction Stop
+        if ($hash.Hash -ne $release.Sha256) {
+            throw 'NVM installer SHA-256 does not match its GitHub release digest.'
+        }
+        $signature = Get-AuthenticodeSignature -LiteralPath $installer -ErrorAction Stop
+        if ($signature.Status -ne 'Valid') {
+            throw "NVM installer Authenticode signature is not valid: $($signature.Status)."
+        }
+        $result = Invoke-LoggedProcess -Executable $installer -Arguments @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/SP-', '/CURRENTUSER',
+            '/NORESTART', '/RESTARTEXITCODE=3010', '/NOCLOSEAPPLICATIONS',
+            '/OFFICIALNODE=ignore', ('/LOG="{0}"' -f (Join-Path $LogDirectory 'nvm-setup.log'))
+        ) -LogDirectory $LogDirectory
+        if ($result.ExitCode -eq 3010) {
+            throw 'NVM requires a restart. Restart manually and sign in again to retry; the first-sign-in task remains enabled.'
+        }
+        if ($result.ExitCode -ne 0) {
+            throw ('NVM installation failed (0x{0:X8}). See {1}.' -f $result.ExitCode, $LogDirectory)
+        }
+        Update-ProcessPath
+        $installedVersion = Get-NvmVersion -LogDirectory $LogDirectory
+        if ($installedVersion -ne $release.Version) {
+            throw "NVM reports $installedVersion instead of $($release.Version). Check installer logs and PATH conflicts in $LogDirectory."
+        }
+    }
+    finally {
+        [Net.ServicePointManager]::SecurityProtocol = $originalTls
+        if (Test-Path -LiteralPath $installer -PathType Leaf) {
+            Remove-Item -LiteralPath $installer -Force -ErrorAction Stop
+        }
     }
 }
 
@@ -307,10 +412,16 @@ function Install-LanguageRuntimes {
     )
 
     $node = Get-LatestNodeLts
+    $nvmVersion = [version]((Get-NvmVersion -LogDirectory $LogDirectory).Split('-')[0])
+    $nodeArguments = @($node.Version)
+    if ($nvmVersion.Major -lt 2) {
+        $nodeArguments += '64'
+    }
+    # NVM 2 uses the native x64 build; a trailing "64" would request another Node version.
     Write-Host "Installing and activating Node.js LTS $($node.Version) ($($node.Lts))."
-    Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments @('install', $node.Version, '64') `
+    Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments (@('install') + $nodeArguments) `
         -LogDirectory $LogDirectory | Out-Null
-    Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments @('use', $node.Version, '64') `
+    Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments (@('use') + $nodeArguments) `
         -LogDirectory $LogDirectory | Out-Null
     Update-ProcessPath
     $nodeJson = Invoke-ToolCommand -CommandName 'node.exe' -Arguments @(
@@ -325,7 +436,7 @@ function Install-LanguageRuntimes {
         $activeNode.arch -ne 'x64') {
         throw "Active Node.js does not match LTS $($node.Version) for x64. Check NVM and PATH conflicts."
     }
-    Invoke-ToolCommand -CommandName 'npm.cmd' -Arguments @('--version') `
+    Invoke-ToolCommand -CommandName 'npm' -Arguments @('--version') `
         -LogDirectory $LogDirectory | Out-Null
 
     Write-Host "Installing the latest Python $PythonVersion patch available to uv."
@@ -385,6 +496,7 @@ try {
     Update-ProcessPath
     $wingetExecutable = Initialize-WinGet -LogDirectory $logDirectory
     Install-DevToolPackages -WinGetExecutable $wingetExecutable -LogDirectory $logDirectory
+    Install-NvmForWindows -LogDirectory $logDirectory
     Test-DevToolCommands -LogDirectory $logDirectory
     Install-LanguageRuntimes -PythonVersion $PythonVersion -LogDirectory $logDirectory
 
