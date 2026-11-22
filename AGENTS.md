@@ -1,4 +1,4 @@
-# Agent instructions
+# AGENTS.md
 
 ## Architecture
 
@@ -32,6 +32,7 @@ Use `appmod-box/infra/main.bicep` for the other project. These local checks do n
 
 ## Repository conventions
 
+- Make atomic commits: each commit should contain one cohesive change. Commit completed changes promptly and push them to the remote unless the user explicitly requests otherwise.
 - Keep azd environment mappings in each `infra/main.parameters.json` aligned with Bicep parameters and both preprovision implementations. For numeric or boolean azd inputs, use string Bicep parameters and convert with `int()` or `bool()` so malformed values fail rather than silently default.
 - Preserve explicit Windows client license confirmation; the administrator password is a secure Bicep parameter. Do not output account keys.
 - Payload builders and staging scripts enforce a 90,000-character compressed payload limit and a 1 MiB expanded limit. Update both Bash and PowerShell packaging paths and payload tests together when changing staged files or their format.
