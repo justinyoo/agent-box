@@ -4,14 +4,14 @@
 .SYNOPSIS
 Installs App Modernisation VM tools after per-item confirmation.
 .DESCRIPTION
-Run in an elevated Windows x64 appmoduser session, not as SYSTEM. Windows
+Run in an elevated Windows x64 local administrator session, not as SYSTEM. Windows
 PowerShell 5.1 bootstraps WinGet and PowerShell 7 when necessary, then runs the
 remaining installation in PowerShell 7.
 
 The installer preserves existing tools, asks before each installation, and stops
 for manual restarts. -Yes approves the listed package agreements and actions.
 The script does not authenticate tools, launch Docker Desktop, or create a Linux
-user. Run it as appmoduser after signing in.
+user. Run it as the configured local administrator after signing in.
 .PARAMETER Yes
 Approve all package installations, license terms, and setup changes.
 .PARAMETER Help
@@ -748,8 +748,8 @@ function Install-VmUbuntu {
     }
     $version = Get-VmUbuntuVersion
     if ($version -eq 1) { throw 'The existing Ubuntu uses WSL1. Preserve its data and convert it to WSL2 manually.' }
-    if ($version -eq 2) { Write-InstallMessage '[PASS] Verified Ubuntu on WSL2 for appmoduser.'; return $true }
-    if (-not (Confirm-InstallAction 'Install Ubuntu on WSL2 for appmoduser. Set up the first Linux user manually afterward.')) {
+    if ($version -eq 2) { Write-InstallMessage '[PASS] Verified Ubuntu on WSL2 for the current user.'; return $true }
+    if (-not (Confirm-InstallAction 'Install Ubuntu on WSL2 for the current user. Set up the first Linux user manually afterward.')) {
         return $false
     }
     $null = Invoke-VmInstaller wsl.exe @('--install', '--distribution', 'Ubuntu', '--no-launch')
@@ -839,7 +839,7 @@ function Set-VmPostgresPath {
         [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"')).TrimEnd('\', '/')
     })
     if ($directory.TrimEnd('\', '/') -notin $entries) {
-        if (-not (Confirm-InstallAction "Append '$directory' to appmoduser's user PATH. Existing entries and their order will be preserved.")) {
+        if (-not (Confirm-InstallAction "Append '$directory' to the current user's PATH. Existing entries and their order will be preserved.")) {
             Write-InstallMessage '[MANUAL] PostgreSQL 18 user PATH configuration was skipped.'
             return $false
         }
@@ -1091,13 +1091,14 @@ function Assert-VmInstallerContext {
         throw 'Installation requires an interactive administrator session or the explicit -Yes switch.'
     }
     $current = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $account = Get-LocalUser -Name appmoduser -ErrorAction Stop
-    if ($current.IsSystem -or $current.User.Value -ne $account.SID.Value) {
-        throw 'Sign in as appmoduser and run this from an elevated terminal of the same account.'
+    $adminUsername = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ADMIN_USERNAME_BASE64__'))
+    $account = Get-LocalUser -Name $adminUsername -ErrorAction Stop
+    if ($current.IsSystem -or -not $account.Enabled -or $current.User.Value -ne $account.SID.Value) {
+        throw "Sign in as the configured local administrator $adminUsername before running this installer."
     }
     $principal = New-Object Security.Principal.WindowsPrincipal($current)
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw 'Reopen the appmoduser terminal as administrator.'
+        throw 'Open PowerShell as administrator under the signed-in local administrator account.'
     }
 }
 
@@ -1183,7 +1184,7 @@ if ($MyInvocation.InvocationName -eq '.') {
     if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'Dot-sourcing requires PowerShell 7. Run this script normally from Windows PowerShell 5.1.' }
 }
 elseif ($Help) {
-    Write-Host 'Run after signing in as appmoduser in an elevated PowerShell terminal:'
+    Write-Host 'Run after signing in as the configured local administrator in an elevated PowerShell terminal:'
     Write-Host '  powershell.exe -NoProfile -File "$HOME\scripts\install-vm-tools.ps1"'
     Write-Host 'Use -Yes to approve every listed installation, package agreement, and setup change.'
     Write-Host 'If a restart is requested, restart manually and rerun the same command.'

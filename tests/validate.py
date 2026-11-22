@@ -658,7 +658,7 @@ def check_real_azd_hooks():
                 if project == "agent-box":
                     values = ["MAI_FOUNDRY_REGION=eastus"]
                 else:
-                    values = ["APP_MOD_VM_SIZE=Standard_D16s_v5", "APP_MOD_OS_DISK_SIZE_GB=512",
+                    values = ["VM_ADMIN_USERNAME=customworkshop", "APP_MOD_VM_SIZE=Standard_D16s_v5", "APP_MOD_OS_DISK_SIZE_GB=512",
                               "APP_MOD_AUTO_SHUTDOWN_ENABLED=false", "APP_MOD_AUTO_SHUTDOWN_TIME=2100"]
                 configured = azd(project, "env", "set", *values, "--environment", environment, "--no-prompt")
                 assert configured.returncode == 0, configured.stdout + configured.stderr
@@ -849,6 +849,20 @@ def check_templates(directory):
     assert workshop_workstation["properties"]["parameters"]["confirmWindowsClientLicense"]["value"] == (
         "[parameters('confirmWindowsClientLicense')]"
     )
+    workshop = outputs["workshop"]
+    assert workshop["parameters"]["adminUsername"]["defaultValue"] == "appmoduser"
+    assert workshop["parameters"]["adminUsername"]["minLength"] == 1
+    assert workshop["parameters"]["adminUsername"]["maxLength"] == 20
+    assert workshop["outputs"]["AZURE_VM_ADMIN_USERNAME"]["value"] == "[parameters('adminUsername')]"
+    assert workshop_workstation["properties"]["parameters"]["adminUsername"]["value"] == "[parameters('adminUsername')]"
+    workshop_vm = next(resource for resource in workshop_workstation["properties"]["template"]["resources"]
+                       if resource["type"] == "Microsoft.Compute/virtualMachines")
+    assert workshop_vm["properties"]["osProfile"]["adminUsername"] == "[parameters('adminUsername')]"
+    workshop_scripts = next(module for module in workshop["resources"] if module["name"] == "user-scripts")
+    assert workshop_scripts["properties"]["parameters"]["adminUsername"]["value"] == "[parameters('adminUsername')]"
+    assert "base64(parameters('adminUsername'))" in workshop_scripts["properties"]["template"]["variables"]["stagingScript"]
+    workshop_bindings = json.loads((WORKSHOP / "main.parameters.json").read_text())["parameters"]
+    assert workshop_bindings["adminUsername"]["value"] == "${VM_ADMIN_USERNAME}"
     assert agent_modules["agent-box-user-scripts"]["properties"]["parameters"]["adminUsername"]["value"] == (
         "[parameters('adminUsername')]"
     )
@@ -1008,6 +1022,7 @@ def check_scripts():
         "DEPLOYMENT_TEMPLATE": "app-modernisation-workshop",
         "AZURE_RESOURCE_GROUP": "rg-workshop-test",
         "AZURE_VM_NAME": "vm-workshop-test",
+        "AZURE_VM_ADMIN_USERNAME": "customworkshop",
     }
     agent_outputs = {
         **ENV,
@@ -1020,11 +1035,11 @@ def check_scripts():
         (("pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File"), "postprovision.ps1"),
     ):
         guidance = run(*shell, str(WORKSHOP / "scripts" / hook), env=workshop_outputs)
-        assert "README.md" in guidance.stdout
+        assert "README.md" in guidance.stdout and r".\customworkshop" in guidance.stdout
         guidance = run(*shell, str(AGENT / "scripts" / hook), env=agent_outputs)
         assert r".\customadmin" in guidance.stdout and r".\agentboxuser" not in guidance.stdout
         for project, outputs in ((WORKSHOP, workshop_outputs), (AGENT, agent_outputs)):
-            for name in ("AZURE_RESOURCE_GROUP", "AZURE_VM_NAME"):
+            for name in ("AZURE_RESOURCE_GROUP", "AZURE_VM_NAME", "AZURE_VM_ADMIN_USERNAME"):
                 failure = run(*shell, str(project / "scripts" / hook),
                               env={**outputs, name: ""}, succeeds=False)
                 assert name in failure.stderr

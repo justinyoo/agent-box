@@ -79,10 +79,11 @@ if find "$repo/infra/.generated" "$fixture/custom output" -name '.payload.*' | g
     exit 1
 fi
 
-AZURE_RESOURCE_GROUP='rg-test with spaces' AZURE_VM_NAME='vm-test' \
+AZURE_RESOURCE_GROUP='rg-test with spaces' AZURE_VM_NAME='vm-test' AZURE_VM_ADMIN_USERNAME='customadmin' \
     bash "$ROOT/scripts/postprovision.sh" > "$fixture/instructions"
 grep -Fq 'Resource group: rg-test with spaces' "$fixture/instructions"
 grep -Fq 'VM: vm-test' "$fixture/instructions"
+grep -Fq '.\customadmin' "$fixture/instructions"
 grep -Fq '$HOME\scripts\install-vm-tools.ps1' "$fixture/instructions"
 if AZURE_RESOURCE_GROUP='' bash "$ROOT/scripts/postprovision.sh" > "$fixture/missing.log" 2>&1; then
     printf '%s\n' '[FAIL] Missing deployment outputs were accepted.' >&2

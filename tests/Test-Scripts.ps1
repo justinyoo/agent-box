@@ -580,24 +580,57 @@ function Invoke-VmToolInstallation { Write-InstallMessage '[PASS] fixture instal
     $installerPath = Join-Path $scriptsDirectory 'install-vm-tools.ps1'
     $configPath = Join-Path $scriptsDirectory 'buildtools.vsconfig'
     $legacyPath = Join-Path $scriptsDirectory 'java-tools.ps1'
+    $state = @{ Username = ''; Enabled = $true; Administrator = $true }
+    function Get-LocalUser {
+        param([string]$Name)
+        $state.Username = $Name
+        return [pscustomobject]@{ Enabled = $state.Enabled; SID = [pscustomobject]@{ Value = 'S-1-5-21-456' } }
+    }
+    function Get-LocalGroupMember {
+        if ($state.Administrator) { return [pscustomobject]@{ SID = [pscustomobject]@{ Value = 'S-1-5-21-456' } } }
+    }
+    function Get-VmProfilePath { return $temporary }
     try {
         $null = New-Item -ItemType Directory -Path $scriptsDirectory -Force
         [IO.File]::WriteAllText($installerPath, 'existing user changes')
         [IO.File]::WriteAllText($legacyPath, 'existing legacy file')
         $payload = Expand-VmPayload (New-VmPayload (Get-VmPayloadSources)).content
+        $username = "custom'admin"
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($username))
+        if ((Resolve-VmUserProfile -Username $username) -cne [IO.Path]::GetFullPath($temporary) -or
+            $state.Username -cne $username) {
+            throw 'App Modernisation staging did not resolve the configured administrator profile.'
+        }
+        foreach ($case in @('Enabled', 'Administrator')) {
+            $state[$case] = $false
+            $errorMessage = ''
+            try { Resolve-VmUserProfile -Username $username | Out-Null }
+            catch { $errorMessage = $_.Exception.Message }
+            if (-not $errorMessage) { throw "App Modernisation staging accepted an invalid administrator: $case." }
+            $state[$case] = $true
+        }
         $blocked = $false
-        try { Write-VmUserFiles -ProfilePath $temporary -Payload $payload }
+        try { Write-VmUserFiles -ProfilePath $temporary -Payload $payload -AdminUsernameBase64 $encoded }
         catch { $blocked = $_.Exception.Message -match 'Preserving different existing file' }
         if (-not $blocked -or [IO.File]::ReadAllText($installerPath) -cne 'existing user changes' -or
             (Test-Path -LiteralPath $configPath)) {
             throw 'App Modernisation staging did not preserve the existing installer before writing.'
         }
         Remove-Item -LiteralPath $installerPath -Force
-        Write-VmUserFiles -ProfilePath $temporary -Payload $payload
+        Write-VmUserFiles -ProfilePath $temporary -Payload $payload -AdminUsernameBase64 $encoded
+        Write-VmUserFiles -ProfilePath $temporary -Payload $payload -AdminUsernameBase64 $encoded
         foreach ($file in $payload.files) {
             $staged = Join-Path $scriptsDirectory $file.name
-            if ((Get-VmBytesHash ([IO.File]::ReadAllBytes($staged))) -ne
-                (Get-VmBytesHash ([Convert]::FromBase64String($file.content)))) {
+            $expected = [Convert]::FromBase64String($file.content)
+            if ($file.name -eq 'install-vm-tools.ps1') {
+                $source = [Text.Encoding]::UTF8.GetString($expected)
+                $expected = [Text.Encoding]::UTF8.GetBytes($source.Replace('__ADMIN_USERNAME_BASE64__', $encoded))
+                $tokens = $null
+                $errors = $null
+                $null = [Management.Automation.Language.Parser]::ParseFile($staged, [ref]$tokens, [ref]$errors)
+                if ($errors.Count -gt 0) { throw "Staged workshop installer has parse errors: $($errors | Out-String)" }
+            }
+            if ((Get-VmBytesHash ([IO.File]::ReadAllBytes($staged))) -ne (Get-VmBytesHash $expected)) {
                 throw "App Modernisation staging changed $($file.name)."
             }
         }

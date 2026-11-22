@@ -3,6 +3,7 @@ targetScope = 'resourceGroup'
 param location string
 param tags object
 param resourceToken string
+param adminUsername string
 
 @secure()
 param adminPassword string
@@ -159,9 +160,7 @@ resource vm 'Microsoft.Compute/virtualMachines@2025-04-01' = {
     }
     osProfile: {
       computerName: take('w11-${resourceToken}', 15)
-      // The workshop requires this fixed local administrator account.
-      #disable-next-line adminusername-should-not-be-literal
-      adminUsername: 'appmoduser'
+      adminUsername: adminUsername
       adminPassword: adminPassword
       windowsConfiguration: {
         provisionVMAgent: true

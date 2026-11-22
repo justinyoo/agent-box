@@ -85,8 +85,9 @@ try {
 
     $profile = Join-Path $fixture 'profile with spaces'
     $null = [IO.Directory]::CreateDirectory($profile)
-    Write-VmUserFiles $profile $payload
-    Write-VmUserFiles $profile $payload
+    $encodedAdmin = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('appmoduser'))
+    Write-VmUserFiles $profile $payload $encodedAdmin
+    Write-VmUserFiles $profile $payload $encodedAdmin
     Assert-True ((Get-ChildItem (Join-Path $profile 'scripts') -File).Count -eq $sources.Count) 'same payload is idempotent'
     & {
         . (Join-Path $profile 'scripts\install-vm-tools.ps1')
@@ -94,20 +95,20 @@ try {
     }
     $modified = Join-Path $profile 'scripts\install-vm-tools.ps1'
     [IO.File]::WriteAllText($modified, 'user edit')
-    Assert-Throws { Write-VmUserFiles $profile $payload } 'Preserving different' 'user edits are never overwritten'
+    Assert-Throws { Write-VmUserFiles $profile $payload $encodedAdmin } 'Preserving different' 'user edits are never overwritten'
     Assert-True ([IO.File]::ReadAllText($modified) -eq 'user edit') 'conflicting content remains intact'
     $badPayload = [pscustomobject]@{ files=@([pscustomobject]@{name='..\escape.ps1';content='YQ=='}) }
-    Assert-Throws { Write-VmUserFiles $profile $badPayload } 'Invalid' 'path traversal is rejected'
+    Assert-Throws { Write-VmUserFiles $profile $badPayload $encodedAdmin } 'Invalid' 'path traversal is rejected'
     $duplicate = [pscustomobject]@{ files=@(
         [pscustomobject]@{name='a.ps1';content='YQ=='},
         [pscustomobject]@{name='A.ps1';content='Yg=='}
     ) }
-    Assert-Throws { Write-VmUserFiles $profile $duplicate } 'duplicate' 'case-insensitive duplicate names fail'
+    Assert-Throws { Write-VmUserFiles $profile $duplicate $encodedAdmin } 'duplicate' 'case-insensitive duplicate names fail'
     Assert-True (-not (Test-Path (Join-Path $profile 'scripts\a.ps1'))) 'conflicts are checked before writing'
     if ($IsWindows) {
         $junction = Join-Path $fixture 'junction'
         $null = New-Item -ItemType Junction -Path $junction -Target $profile
-        Assert-Throws { Write-VmUserFiles $junction $payload } 'reparse' 'profile junctions are rejected'
+        Assert-Throws { Write-VmUserFiles $junction $payload $encodedAdmin } 'reparse' 'profile junctions are rejected'
         Remove-Item -LiteralPath $junction -Force
     }
 
@@ -472,14 +473,17 @@ namespace Appmod {
     }
 
     & {
+        $definition = (Get-Command Assert-VmInstallerContext -CommandType Function).Definition
+        $definition = $definition.Replace('__ADMIN_USERNAME_BASE64__', $encodedAdmin)
+        Invoke-Expression "function Assert-VmInstallerContext {`n$definition`n}"
         function Test-InstallInteractive { return $false }
         function Read-Host { throw 'must not prompt' }
         $Yes = $false
         Assert-Throws { Confirm-InstallAction 'fixture' } 'interactive.*-Yes' 'noninteractive mode requires Yes'
         Assert-Throws { Assert-VmInstallerContext } 'interactive.*-Yes|Windows x64' 'noninteractive identity guard runs before installation'
         function Test-InstallInteractive { return $true }
-        function Get-LocalUser { [pscustomobject]@{SID=[pscustomobject]@{Value='S-1-5-21-123-456-789-1001'}} }
-        Assert-Throws { Assert-VmInstallerContext } 'Sign in as appmoduser|Windows x64' 'another Windows account cannot install tools'
+        function Get-LocalUser { [pscustomobject]@{Enabled=$true; SID=[pscustomobject]@{Value='S-1-5-21-123-456-789-1001'}} }
+        Assert-Throws { Assert-VmInstallerContext } 'configured local administrator|Windows x64' 'another Windows account cannot install tools'
     }
 
     & {
@@ -981,7 +985,7 @@ function Enable-WindowsOptionalFeature {
         Assert-True ((Invoke-VmToolInstallation) -eq 3010) 'new reboot requirement stops subsequent installation steps'
     }
 
-    $staging = [IO.File]::ReadAllText((Join-Path $root 'scripts\stage-user-scripts.ps1')).Replace('__PAYLOAD_BASE64__', $bundle.content)
+    $staging = [IO.File]::ReadAllText((Join-Path $root 'scripts\stage-user-scripts.ps1')).Replace('__PAYLOAD_BASE64__', $bundle.content).Replace('__ADMIN_USERNAME_BASE64__', $encodedAdmin)
     $tokens=$null; $errors=$null
     $null = [Management.Automation.Language.Parser]::ParseInput($staging, [ref]$tokens, [ref]$errors)
     Assert-True ($errors.Count -eq 0) 'generated inline staging script parses'
@@ -1033,7 +1037,8 @@ exit 37
         Assert-True ($raw -notmatch 'AADLoginForWindows|roleAssignments|principalId|runAsPassword') 'no Entra login or copied administrator secrets'
         $workstation = @($template.resources | Where-Object name -eq 'workstation')[0].properties.template
         $vm = @($workstation.resources | Where-Object type -eq 'Microsoft.Compute/virtualMachines')[0]
-        Assert-True ($vm.properties.osProfile.adminUsername -eq 'appmoduser') 'local admin username cannot vary'
+        Assert-True ($template.parameters.adminUsername.defaultValue -eq 'appmoduser' -and
+            $vm.properties.osProfile.adminUsername -eq "[parameters('adminUsername')]") 'default and configurable administrator name are preserved'
         Assert-True ($vm.properties.securityProfile.uefiSettings.secureBootEnabled -and
             $vm.properties.securityProfile.uefiSettings.vTpmEnabled) 'Windows 11 secure boot and TPM preserved'
         $schedule = @($workstation.resources | Where-Object type -eq 'Microsoft.DevTestLab/schedules')[0]

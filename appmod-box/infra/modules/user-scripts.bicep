@@ -2,15 +2,20 @@ targetScope = 'resourceGroup'
 
 param location string
 param vmName string
+param adminUsername string
 param tags object
 @minLength(1)
 @maxLength(90000)
 param scriptPayload string
 
 var stagingScript = replace(
-  loadTextContent('../scripts/stage-user-scripts.ps1'),
-  '__PAYLOAD_BASE64__',
-  scriptPayload
+  replace(
+    loadTextContent('../scripts/stage-user-scripts.ps1'),
+    '__PAYLOAD_BASE64__',
+    scriptPayload
+  ),
+  '__ADMIN_USERNAME_BASE64__',
+  base64(adminUsername)
 )
 
 resource vm 'Microsoft.Compute/virtualMachines@2025-04-01' existing = {

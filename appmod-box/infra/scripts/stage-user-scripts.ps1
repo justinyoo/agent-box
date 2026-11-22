@@ -1,6 +1,7 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$PayloadBase64 = '__PAYLOAD_BASE64__'
+    [string]$PayloadBase64 = '__PAYLOAD_BASE64__',
+    [string]$AdminUsernameBase64 = '__ADMIN_USERNAME_BASE64__'
 )
 
 function Expand-VmPayload {
@@ -108,7 +109,7 @@ function Get-VmBytesHash {
 }
 
 function Write-VmUserFiles {
-    param([string]$ProfilePath, $Payload)
+    param([string]$ProfilePath, $Payload, [string]$AdminUsernameBase64)
     Assert-VmPath $ProfilePath
     if (-not (Test-Path -LiteralPath $ProfilePath -PathType Container)) { throw 'Profile directory is missing.' }
     $directory = Join-Path $ProfilePath 'scripts'
@@ -125,6 +126,12 @@ function Write-VmUserFiles {
         $path = Join-Path $directory $file.name
         Assert-VmPath $path
         $bytes = [Convert]::FromBase64String($file.content)
+        if ($file.name -ceq 'install-vm-tools.ps1') {
+            $script = [Text.Encoding]::UTF8.GetString($bytes)
+            $placeholder = '__ADMIN_USERNAME_' + 'BASE64__'
+            if (-not $script.Contains($placeholder)) { throw 'Installer administrator placeholder is missing.' }
+            $bytes = [Text.Encoding]::UTF8.GetBytes($script.Replace($placeholder, $AdminUsernameBase64))
+        }
         if ($bytes.Length -gt 262144) { throw "Payload file too large: $($file.name)" }
         if (Test-Path -LiteralPath $path) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
@@ -147,9 +154,11 @@ function Write-VmUserFiles {
 if ($MyInvocation.InvocationName -ne '.') {
     $ErrorActionPreference = 'Stop'
     try {
+        $adminUsername = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($AdminUsernameBase64))
+        if ([string]::IsNullOrWhiteSpace($adminUsername)) { throw 'Administrator username is missing.' }
         $payload = Expand-VmPayload $PayloadBase64
-        $profile = Resolve-VmUserProfile -Username 'appmoduser'
-        Write-VmUserFiles -ProfilePath $profile -Payload $payload
+        $profile = Resolve-VmUserProfile -Username $adminUsername
+        Write-VmUserFiles -ProfilePath $profile -Payload $payload -AdminUsernameBase64 $AdminUsernameBase64
     }
     catch {
         Write-Error "VM script staging failed: $($_.Exception.Message)" -ErrorAction Continue

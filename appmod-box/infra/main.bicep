@@ -50,10 +50,14 @@ param scriptPayloadPart1 string = ''
 param scriptPayloadPart2 string = ''
 param scriptPayloadPart3 string = ''
 
+@minLength(1)
+@maxLength(20)
+param adminUsername string = 'appmoduser'
+
 @secure()
 @minLength(12)
 @maxLength(123)
-@description('Local administrator password for appmoduser. Include at least three of uppercase letters, lowercase letters, digits and special characters.')
+@description('Local administrator password. Include at least three of uppercase letters, lowercase letters, digits and special characters.')
 param adminPassword string
 
 @allowed([
@@ -104,6 +108,7 @@ module workstation 'modules/workstation.bicep' = {
     location: location
     tags: tags
     resourceToken: resourceToken
+    adminUsername: adminUsername
     adminPassword: adminPassword
     confirmWindowsClientLicense: confirmWindowsClientLicense
     vmSize: vmSize
@@ -119,6 +124,7 @@ module userScripts 'modules/user-scripts.bicep' = {
   params: {
     location: location
     vmName: workstation.outputs.vmName
+    adminUsername: adminUsername
     tags: tags
     scriptPayload: '${scriptPayloadPart1}${scriptPayloadPart2}${scriptPayloadPart3}'
   }
@@ -128,6 +134,6 @@ output AZURE_LOCATION string = location
 output AZURE_RESOURCE_GROUP string = rg.name
 output AZURE_VM_NAME string = workstation.outputs.vmName
 output AZURE_VM_ID string = workstation.outputs.vmId
-output AZURE_VM_ADMIN_USERNAME string = 'appmoduser'
+output AZURE_VM_ADMIN_USERNAME string = adminUsername
 output AZURE_BASTION_NAME string = workstation.outputs.bastionName
 output AZURE_SCRIPT_DELIVERY string = userScripts.outputs.runCommandName

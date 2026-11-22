@@ -77,6 +77,8 @@ If a restart is requested, restart Windows manually and rerun the command. The i
 
 Existing tools and unrelated Python/Node installations are preserved. The nvm-windows setup is selected from its latest stable GitHub release and validated with its SHA-256 digest and Authenticode signature. The Copilot app uses the official `github/app` x64 MSI and a valid GitHub Authenticode signature; the release SHA-256 digest is checked when GitHub publishes one.
 
+The repository's installer is a template populated with the configured administrator name during deployment. Use the staged file rather than executing the raw repository file directly.
+
 ### Manual post-install checks
 
 After the script completes:

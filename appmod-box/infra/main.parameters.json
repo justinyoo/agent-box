@@ -7,6 +7,7 @@
     "scriptPayloadPart1": { "value": "${VM_SCRIPT_PAYLOAD_1}" },
     "scriptPayloadPart2": { "value": "${VM_SCRIPT_PAYLOAD_2}" },
     "scriptPayloadPart3": { "value": "${VM_SCRIPT_PAYLOAD_3}" },
+    "adminUsername": { "value": "${VM_ADMIN_USERNAME}" },
     "adminPassword": { "value": "${VM_ADMIN_PASSWORD}" },
     "vmSize": { "value": "${APP_MOD_VM_SIZE}" },
     "osDiskSizeGB": { "value": "${APP_MOD_OS_DISK_SIZE_GB}" },

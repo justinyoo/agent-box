@@ -2,7 +2,7 @@
 
 [저장소 템플릿 안내](../README.md)
 
-`azure.yaml`로 Windows 11 VM을 만들고, 로컬 관리자 `appmoduser`의 `$HOME/scripts`에 설치 도우미를 복사합니다. 도구는 VM에 로그인한 뒤 설치합니다.
+`azure.yaml`로 Windows 11 VM을 만들고, 지정한 로컬 관리자(기본값 `appmoduser`)의 `$HOME/scripts`에 설치 도우미를 복사합니다. 도구는 VM에 로그인한 뒤 설치합니다.
 
 ## 기본 구성
 
@@ -13,7 +13,7 @@
 | VM | `Standard_D8s_v5`, 8 vCPU, 32 GiB |
 | OS 디스크 | Premium SSD 256 GiB |
 | 부팅 보안 | Trusted Launch, Secure Boot, vTPM |
-| Windows 로그인 | `.\appmoduser`, 로컬 관리자, 사용자가 입력한 암호 |
+| Windows 로그인 | 기본 `.\appmoduser`, 로컬 관리자, 사용자가 입력한 암호 |
 | 접속 | Azure portal의 Bastion Developer |
 | 네트워크 | VM 공용 IP 없음, NAT Gateway를 통해 인터넷 접속 |
 | 자동 종료 | 기본적으로 매일 한국 시간 00:00 할당 취소 |
@@ -68,11 +68,11 @@ VM은 Entra ID 로그인과 Managed Identity를 사용하지 않습니다. 배�
 
 azd의 최초 지역 선택 목록은 Bastion Developer와 기본 VM 이미지의 지원 지역 교집합을 기록한 [`infra/main.bicep`](infra/main.bicep)의 목록으로 제한됩니다. 이 목록은 실시간 조회 결과가 아닌 확인 시점의 스냅샷입니다. 배포 전에는 선택한 지역의 Bastion Developer 지원 여부와 해당 구독의 VM 이미지 및 크기를 다시 확인합니다. 이 확인은 실제 할당량이나 용량을 보장하지 않습니다. 목록의 다른 지역을 선택하려면 `azd env set AZURE_LOCATION <region>`을 실행하세요.
 
-워크숍 설정은 `azd env set`으로 변경할 수 있습니다. 예를 들어 한국 시간 오후 9시에 자동 종료하려면 `azd env set APP_MOD_AUTO_SHUTDOWN_TIME 2100`을 실행하세요. 시간은 `0000`부터 `2359`까지의 유효한 24시간제 `HHmm` 형식입니다. `APP_MOD_AUTO_SHUTDOWN_ENABLED`로 자동 종료를 켜거나 끄고, `APP_MOD_VM_SIZE`와 `APP_MOD_OS_DISK_SIZE_GB`로 VM 크기와 OS 디스크 크기를 설정할 수 있습니다. 미지정 시에만 기본값을 적용합니다.
+워크숍 설정은 `azd env set`으로 변경할 수 있습니다. 관리자 이름을 변경하려면 배포 전에 `azd env set VM_ADMIN_USERNAME <username>`을 실행하세요. 예를 들어 한국 시간 오후 9시에 자동 종료하려면 `azd env set APP_MOD_AUTO_SHUTDOWN_TIME 2100`을 실행하세요. 시간은 `0000`부터 `2359`까지의 유효한 24시간제 `HHmm` 형식입니다. `APP_MOD_AUTO_SHUTDOWN_ENABLED`로 자동 종료를 켜거나 끄고, `APP_MOD_VM_SIZE`와 `APP_MOD_OS_DISK_SIZE_GB`로 VM 크기와 OS 디스크 크기를 설정할 수 있습니다. 미지정 시에만 기본값을 적용합니다.
 
 ## 로그인과 도구 설치
 
-1. Azure portal에서 VM의 **연결 > Bastion**을 선택하고 `.\appmoduser`와 배포 시 입력한 암호로 로그인합니다.
+1. Azure portal에서 VM의 **연결 > Bastion**을 선택하고 지정한 로컬 관리자(기본 `.\appmoduser`)와 배포 시 입력한 암호로 로그인합니다.
 1. PowerShell을 **관리자 권한으로 실행**합니다.
 1. 다음 명령을 실행하고 필요한 항목에 동의합니다.
 
@@ -92,6 +92,8 @@ azd의 최초 지역 선택 목록은 Bastion Developer와 기본 VM 이미지�
 
 기존 VM을 다시 프로비저닝할 때 `$HOME/scripts/install-vm-tools.ps1`이 새 버전과 다르면 사용자 파일을 보호하기 위해 배포가 중단됩니다. 기존 파일을 백업하거나 다른 위치로 옮긴 뒤 다시 실행하세요. 이전 버전에서 전달된 보조 스크립트는 자동으로 삭제하지 않습니다.
 
+저장소의 설치 스크립트는 배포 시 관리자 이름이 채워지는 템플릿입니다. 원본 파일을 그대로 다운로드해 실행하지 말고 배포된 파일을 사용하세요. Build Tools 설치에는 같은 디렉터리의 `buildtools.vsconfig`도 필요합니다.
+
 ### 설치 대상
 
 다음 순서로 설치하며, 재부팅이 필요하면 중단합니다.
@@ -101,7 +103,7 @@ azd의 최초 지역 선택 목록은 Bastion Developer와 기본 VM 이미지�
 | 1. 설치 도구 | WinGet | App Installer 등록 또는 설치 |
 | 1. 설치 도구 | PowerShell | 7.x 정식 버전. 기존 버전은 자동 업데이트하지 않음 |
 | 2. Windows 기능 | WSL2 플랫폼 | 배포판 없이 `wsl.exe --install --no-distribution`으로 설치. 설치 후 직접 재부팅 |
-| 2. Windows 기능 | Ubuntu | WSL2 설치 후 `appmoduser`에 등록 |
+| 2. Windows 기능 | Ubuntu | WSL2 설치 후 지정한 관리자 계정에 등록 |
 | 2. Windows 기능 | MSMQ | Server 기능 활성화 및 서비스 시작. 큐와 데이터는 생성하지 않음 |
 | 3. 런타임 및 SDK | Visual C++ x64 런타임 | `Microsoft.VCRedist.2015+.x64` 설치 및 DLL 확인 |
 | 3. 런타임 및 SDK | .NET Framework | 4.8 이상 런타임 확인, 없으면 4.8.1 설치 |

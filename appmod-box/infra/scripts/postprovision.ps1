@@ -7,7 +7,8 @@ trap {
 
 if (-not $env:AZURE_RESOURCE_GROUP) { throw 'AZURE_RESOURCE_GROUP is missing from the deployment outputs.' }
 if (-not $env:AZURE_VM_NAME) { throw 'AZURE_VM_NAME is missing from the deployment outputs.' }
-$adminUsername = 'appmoduser'
+if (-not $env:AZURE_VM_ADMIN_USERNAME) { throw 'AZURE_VM_ADMIN_USERNAME is missing from the deployment outputs.' }
+$adminUsername = $env:AZURE_VM_ADMIN_USERNAME
 Write-HookMessage "[INFO] Resource group: $env:AZURE_RESOURCE_GROUP"
 Write-HookMessage "[INFO] VM: $env:AZURE_VM_NAME"
 Write-HookMessage '[MANUAL] Connect: Azure portal > VM > Connect > Bastion'
