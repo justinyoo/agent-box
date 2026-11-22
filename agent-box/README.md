@@ -54,20 +54,6 @@ The VM and Foundry regions are independent. The Foundry region is limited to `ea
    az login
    ```
 
-1. Create an azd environment.
-
-   ```bash
-   azd env new <environment-name> --location <azure-region>
-   ```
-
-1. Optionally, configure the environment before deployment.
-
-   To change the local administrator name, run `azd env set VM_ADMIN_USERNAME <username>`.
-
-   To set the independent Foundry region, run `azd env set MAI_FOUNDRY_REGION <region>` with one of the regions listed above. The value is saved in the azd environment. The template does not substitute a different model when deployment is unavailable.
-
-   For non-interactive provisioning, set `MAI_FOUNDRY_REGION` and, after confirming Windows client eligibility, run `azd env config set infra.parameters.confirmWindowsClientLicense true`. The former `CONFIRM_WINDOWS_CLIENT_LICENSE` environment variable is no longer used.
-
 1. Start the deployment.
 
    ```bash
@@ -126,10 +112,6 @@ If no conflicting uv-bin executable exists, the installer uses uv's experimental
 1. Run `wsl -d Ubuntu` to create the first Linux user.
 1. Start Docker Desktop, complete its first-run setup and terms, and verify Linux containers.
 1. Sign in to the Copilot app and authenticate the Azure/GitHub CLIs as needed.
-
-WSL2, Ubuntu, and Docker Desktop are installed by the script, but their operation must be verified manually on the deployed VM. Local tests do not perform these post-deployment checks.
-
-Docker Desktop is free for personal use, education, non-commercial open source, and qualifying small businesses. Commercial use in an organization with **250 or more employees or more than USD 10 million in annual revenue** requires a paid subscription. Review the [Docker Desktop subscription terms](https://www.docker.com/legal/docker-subscription-service-agreement/).
 
 ## Foundry outputs
 
