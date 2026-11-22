@@ -20,8 +20,6 @@
 
 `latest` is the latest image for that SKU used for a new VM. It does not update an existing VM's image or switch to another SKU.
 
-The VM does not use Entra ID login or Managed Identity. Azure sign-in is required for deployment and access to the Azure portal.
-
 ## Prerequisites
 
 - [Azure subscription](https://aka.ms/azure/free)
@@ -30,8 +28,6 @@ The VM does not use Entra ID login or Managed Identity. Azure sign-in is require
 - [License eligibility to use Windows client in Azure](https://learn.microsoft.com/azure/virtual-machines/windows/windows-desktop-multitenant-hosting-deployment)
 
 ## Deploy
-
-**From the repository root, change to the `appmod-box` directory before running the commands.**
 
 1. Change to the `appmod-box` directory.
 
@@ -64,12 +60,6 @@ The VM does not use Entra ID login or Managed Identity. Azure sign-in is require
    azd up
    ```
 
-   In a new azd environment, confirm Windows client license eligibility when prompted for azd parameters. For non-interactive deployments, confirm eligibility and then run `azd env config set infra.parameters.confirmWindowsClientLicense true`. The former `CONFIRM_WINDOWS_CLIENT_LICENSE` environment variable is no longer used. Enter the VM administrator password at the secure azd prompt.
-
-The initial azd region picker is restricted to the list in [`infra/main.bicep`](infra/main.bicep), which records the overlap between supported Bastion Developer and default VM image regions. This list is a snapshot from the time of verification, not a live lookup. Before deployment, recheck Bastion Developer support in the selected region and the VM image and size for the subscription. This check does not guarantee quota or capacity. To select another region from the list, run `azd env set AZURE_LOCATION <region>`.
-
-You can change workshop settings with `azd env set`. To change the administrator name, run `azd env set VM_ADMIN_USERNAME <username>` before deployment. For example, to shut down automatically at 9:00 PM Korea Standard Time, run `azd env set APP_MOD_AUTO_SHUTDOWN_TIME 2100`. The time must be in valid 24-hour `HHmm` format, from `0000` through `2359`. Use `APP_MOD_AUTO_SHUTDOWN_ENABLED` to turn automatic shutdown on or off, and `APP_MOD_VM_SIZE` and `APP_MOD_OS_DISK_SIZE_GB` to set the VM size and OS disk size. Defaults apply only when values are not specified.
-
 ## Sign in and install tools
 
 1. Find the Windows login username in the `azd provision` or `azd up` output. In the Azure portal, select **Connect > Bastion** for the VM, then sign in with that local administrator account (default: `.\appmoduser`) and the password entered during deployment.
@@ -87,12 +77,6 @@ You can change workshop settings with `azd env set`. To change the administrator
    ```
 
 1. If prompted to restart, save your work, restart the VM manually, and rerun the same command.
-
-Installation logs are saved per run under `%ProgramData%\AppModBox\Logs\DevTools`. As with Agent Box, `install.log` contains the transcript, and standard output and errors from major installation and verification commands are saved separately as `command-*.stdout.log` and `command-*.stderr.log`. When switching from Windows PowerShell 5.1 to PowerShell 7, logs for the preparation stage and the remaining installation stages are saved separately.
-
-When reprovisioning an existing VM, deployment stops to protect user files if `$HOME/scripts/install-vm-tools.ps1` differs from the new version. Back up or move the existing file, then run the deployment again. Helper scripts delivered by previous versions are not deleted automatically.
-
-The installer in the repository is a template populated with the administrator name during deployment. Use the deployed file rather than downloading and running the source file unchanged. Build Tools installation also requires `buildtools.vsconfig` in the same directory.
 
 ### Tools installed
 
