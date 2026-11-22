@@ -11,6 +11,7 @@ fail() { write_hook_message "[FAIL] $1" >&2; exit 1; }
 admin_username=$AZURE_VM_ADMIN_USERNAME
 write_hook_message "[INFO] Resource group: $AZURE_RESOURCE_GROUP"
 write_hook_message "[INFO] VM: $AZURE_VM_NAME"
+write_hook_message "[INFO] Windows Login Username: $admin_username"
 write_hook_message '[MANUAL] Connect: Azure portal > VM > Connect > Bastion'
 write_hook_message "[MANUAL] Sign in with .\\$admin_username and the password you entered."
 write_hook_message '[MANUAL] After sign-in, open an elevated PowerShell terminal and run:'

@@ -48,7 +48,7 @@ Resource names follow the azd starter pattern: `rg-{environmentName}` for the re
 
 ## Connect and install tools
 
-After provisioning, connect in Azure portal at **Virtual machines > your VM > Connect > Bastion**. Sign in as `.\<username>` using the configured local administrator name (default `agentboxuser`) and the password entered during provisioning. Open PowerShell as administrator under that same account and run:
+After `azd provision` or `azd up`, the output shows the configured Windows login username. Connect in Azure portal at **Virtual machines > your VM > Connect > Bastion**. Sign in as `.\<username>` using that local administrator name (default `agentboxuser`) and the password entered during provisioning. Open PowerShell as administrator under that same account and run:
 
 ```powershell
 & "$HOME\scripts\install-vm-tools.ps1"

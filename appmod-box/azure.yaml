@@ -22,9 +22,9 @@ hooks:
   postprovision:
     posix:
       shell: sh
-      interactive: false
+      interactive: true
       run: bash ./infra/scripts/postprovision.sh
     windows:
       shell: pwsh
-      interactive: false
+      interactive: true
       run: ./infra/scripts/postprovision.ps1

@@ -11,6 +11,7 @@ if (-not $env:AZURE_VM_ADMIN_USERNAME) { throw 'AZURE_VM_ADMIN_USERNAME is missi
 $adminUsername = $env:AZURE_VM_ADMIN_USERNAME
 Write-HookMessage "[INFO] Resource group: $env:AZURE_RESOURCE_GROUP"
 Write-HookMessage "[INFO] VM: $env:AZURE_VM_NAME"
+Write-HookMessage "[INFO] Windows Login Username: $adminUsername"
 Write-HookMessage '[MANUAL] Connect: Azure portal > VM > Connect > Bastion'
 Write-HookMessage "[MANUAL] Sign in with .\$adminUsername and the password you entered."
 Write-HookMessage '[MANUAL] After sign-in, open an elevated PowerShell terminal and run:'

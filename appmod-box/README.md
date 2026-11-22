@@ -72,7 +72,7 @@ azd의 최초 지역 선택 목록은 Bastion Developer와 기본 VM 이미지�
 
 ## 로그인과 도구 설치
 
-1. Azure portal에서 VM의 **연결 > Bastion**을 선택하고 지정한 로컬 관리자(기본 `.\appmoduser`)와 배포 시 입력한 암호로 로그인합니다.
+1. `azd provision` 또는 `azd up` 출력에서 Windows 로그인 사용자 이름을 확인합니다. Azure portal에서 VM의 **연결 > Bastion**을 선택하고 해당 로컬 관리자(기본 `.\appmoduser`)와 배포 시 입력한 암호로 로그인합니다.
 1. PowerShell을 **관리자 권한으로 실행**합니다.
 1. 다음 명령을 실행하고 필요한 항목에 동의합니다.
 

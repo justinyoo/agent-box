@@ -1036,8 +1036,10 @@ def check_scripts():
     ):
         guidance = run(*shell, str(WORKSHOP / "scripts" / hook), env=workshop_outputs)
         assert "README.md" in guidance.stdout and r".\customworkshop" in guidance.stdout
+        assert "[INFO] Windows Login Username: customworkshop" in guidance.stdout
         guidance = run(*shell, str(AGENT / "scripts" / hook), env=agent_outputs)
         assert r".\customadmin" in guidance.stdout and r".\agentboxuser" not in guidance.stdout
+        assert "[INFO] Windows Login Username: customadmin" in guidance.stdout
         for project, outputs in ((WORKSHOP, workshop_outputs), (AGENT, agent_outputs)):
             for name in ("AZURE_RESOURCE_GROUP", "AZURE_VM_NAME", "AZURE_VM_ADMIN_USERNAME"):
                 failure = run(*shell, str(project / "scripts" / hook),
