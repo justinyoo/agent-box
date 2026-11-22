@@ -2,7 +2,7 @@
 
 [English](README.md) | **한국어**
 
-[저장소 템플릿 안내](../README.md)
+[저장소 템플릿 안내](../README.ko.md)
 
 Agent Box는 Bastion Developer로 접속하고 NAT Gateway를 사용하는 Windows 11 Enterprise 개발 VM을 배포합니다. Microsoft Foundry 계정과 프로젝트를 만들고 `MAI-Image-2.7`도 배포합니다. 도구 설치와 사용자 로그인은 직접 진행합니다.
 

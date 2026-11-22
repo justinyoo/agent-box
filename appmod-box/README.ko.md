@@ -2,7 +2,7 @@
 
 [English](README.md) | **한국어**
 
-[저장소 템플릿 안내](../README.md)
+[저장소 템플릿 안내](../README.ko.md)
 
 `azure.yaml`을 사용해 Windows 11 VM을 만들고 지정한 로컬 관리자 계정(기본값 `appmoduser`)의 `$HOME/scripts`에 설치 도우미를 복사합니다. 도구는 VM에 로그인한 뒤 직접 설치합니다.
 

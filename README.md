@@ -1,5 +1,7 @@
 # Agent Box
 
+**English** | [한국어](README.ko.md)
+
 This repository contains two Azure Developer CLI (`azd`) projects for Windows development VMs:
 
 - [Agent Box](agent-box/README.md): A development VM with Microsoft Foundry resources.
