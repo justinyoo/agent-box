@@ -75,9 +75,9 @@ Windows PowerShell 5.1 prepares WinGet and PowerShell 7.x, then reruns the insta
 | Azure | Azure CLI and Azure Developer CLI (`azd`) |
 | Editor and app | Visual Studio Code and the official GitHub Copilot app for Windows |
 
-Existing tools and unrelated Python/Node installations are preserved. The nvm-windows setup is selected from its latest stable GitHub release and validated with its SHA-256 digest and Authenticode signature. The Copilot app uses the official `github/app` x64 MSI and a valid GitHub Authenticode signature; the release SHA-256 digest is checked when GitHub publishes one.
+Existing tools and unrelated Python/Node installations are preserved. The installer uses the stable nvm-windows 2.x WinGet package and does not replace an existing nvm 1.x installation. The Copilot app uses the official `github/app` x64 MSI and a valid GitHub Authenticode signature; the release SHA-256 digest is checked when GitHub publishes one.
 
-For Copilot CLI, the installer also verifies `copilot --version` when WinGet does not list the package; it reports the discrepancy rather than reinstalling a working CLI. A pending Windows restart stops installation and must be completed manually.
+For Copilot CLI, the installer checks `copilot --version` before and after installation, preserving a working CLI even if WinGet does not list it. A pending Windows restart stops installation and must be completed manually.
 
 Python installation is attempted even if Node.js setup fails; the installer still reports the Node.js failure. The Python patch version is the latest available in the installed uv release's download catalog. If no conflicting Python command or uv-bin executable exists, the installer uses uv's experimental `--default` option to make it available as `python`. Use `uv python list --only-installed` to check uv-managed installations.
 

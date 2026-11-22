@@ -28,13 +28,13 @@ foreach ($file in $files) {
 $installer = Get-Content -LiteralPath (Join-Path $RepositoryRoot 'agent-box/scripts/install-vm-tools.ps1') -Raw
 foreach ($required in @(
         "param(`n    [switch]`$Yes"
-        "'Microsoft.DotNet.SDK.10'"
-        "'Microsoft.DotNet.SDK.11'"
-        "'Docker.DockerDesktop'"
-        "'GitHub.Copilot'"
-        "'Microsoft.Azd'"
+        'Install-VmDotnetSdk 10'
+        'Install-VmDotnetSdk 11'
+        'Install-VmDocker'
+        'Install-VmCopilotCli'
+        'Install-VmAzd'
         'Get-LatestNodeLts'
-        'Install-UbuntuWsl'
+        'Install-VmUbuntu'
         'GitHub-Copilot-windows-x64.msi'
         'Get-AuthenticodeSignature'
 )) {
@@ -58,7 +58,20 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     foreach ($name in @('Test-InstallOutputTerminal', 'Write-InstallMessage', 'Test-InstallInteractive',
             'Confirm-InstallAction', 'Test-RebootPending', 'Invoke-LoggedProcess', 'Find-VmPowerShell',
             'Invoke-VmPowerShell', 'Update-ProcessPath', 'Test-CopilotCli',
-            'Get-CopilotAppVersion', 'Install-CopilotApp', 'Assert-VmInstallerContext')) {
+            'Invoke-ToolProbe', 'Test-MinimumVersion', 'Invoke-VmInstaller', 'Get-VmWingetVersion',
+            'Install-VmPackage', 'Test-VmWinget', 'Initialize-VmWinget', 'Test-VmPowerShell7', 'Install-VmPowerShell',
+            'Get-VmWslExecutable', 'Invoke-VmWindowsFeature', 'Test-VmWslPlatform',
+            'Install-VmWslPlatform', 'Get-VmUbuntuVersion', 'Install-VmUbuntu',
+            'Install-VmDotnetSdk', 'Test-VmCommand', 'Test-VmDesktopApp', 'Install-VmDocker',
+            'Install-VmGit', 'Install-VmGitHubCli', 'Install-VmCopilotCli',
+            'Install-VmAzureCli', 'Install-VmAzd', 'Install-VmVsCode',
+            'Get-PersistentRuntimePath', 'Set-PersistentRuntimePath',
+            'Assert-NoRuntimeCommandConflict', 'Test-RuntimePath', 'Set-RuntimePath',
+            'Get-WorkshopReleaseVersion', 'Get-WorkshopNvmConfiguration', 'Get-WorkshopNvmSelection',
+            'Test-WorkshopNvmOwnership', 'Get-WorkshopNodeRelease', 'Get-LatestNodeLts',
+            'Enable-VmNvmRuntimePath', 'Install-WorkshopNode', 'Install-VmNvm', 'Test-VmNodeCommands',
+            'Get-CopilotAppVersion', 'Install-CopilotApp', 'Assert-VmInstallerContext',
+            'Invoke-VmInstallationSteps')) {
         $definitions = foreach ($project in @('agent-box', 'appmod-box')) {
             $definition = $trees[$project].Find({
                 param($node)
@@ -68,6 +81,37 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
             $definition.Extent.Text
         }
         if ($definitions[0] -cne $definitions[1]) { throw "Installer common function differs: $name" }
+    }
+    $agentFunctions = @($trees['agent-box'].FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst]
+    }, $true))
+    foreach ($definition in $agentFunctions) {
+        if ($definition.Name -eq 'Invoke-VmToolInstallation') { continue }
+        $other = $trees['appmod-box'].Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq $definition.Name
+        }, $true)
+        if ($other -and $definition.Extent.Text -cne $other.Extent.Text) {
+            throw "Installer common function differs: $($definition.Name)"
+        }
+    }
+    foreach ($project in @('agent-box', 'appmod-box')) {
+        $main = $trees[$project].Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-VmToolInstallation'
+        }, $true)
+        foreach ($name in @('Install-VmWslPlatform', 'Install-VmUbuntu', 'Install-VmDotnetSdk',
+                'Install-VmNvm', 'Install-VmDocker', 'Install-VmGit', 'Install-VmGitHubCli',
+                'Install-VmCopilotCli', 'Install-VmAzureCli', 'Install-VmAzd', 'Install-VmVsCode',
+                'Install-CopilotApp', 'Invoke-VmInstallationSteps')) {
+            $call = $main.Find({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq $name
+            }, $true)
+            if (-not $call) { throw "$project does not use shared installer function $name." }
+        }
     }
     $docker = @($trees['appmod-box'].FindAll({
         param($node)
@@ -86,87 +130,251 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     Invoke-Expression $docker[0].Extent.Text
 }
 
-& {
-    Set-StrictMode -Version Latest
-    $tokens = $null
-    $errors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
-    foreach ($name in @('Invoke-WslCommand', 'Test-WslPlatform', 'Install-WslPlatform',
-            'Get-UbuntuWslVersion', 'Install-UbuntuWsl')) {
-        $definition = $ast.Find({
-            param($node)
-            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
-        }, $true)
-        if (-not $definition) { throw "Missing Agent Box WSL function: $name" }
-        Invoke-Expression $definition.Extent.Text
-    }
+foreach ($project in @('agent-box', 'appmod-box')) {
+    & {
+        Set-StrictMode -Version Latest
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $RepositoryRoot "$project/scripts/install-vm-tools.ps1"), [ref]$tokens, [ref]$errors)
+        foreach ($name in @('Invoke-VmInstaller', 'Test-VmWinget', 'Install-VmPackage', 'Test-CopilotCli', 'Install-VmCopilotCli',
+                'Install-VmWslPlatform', 'Get-VmUbuntuVersion', 'Install-VmUbuntu', 'Install-VmDocker',
+                'Enable-VmNvmRuntimePath', 'Install-VmNvm')) {
+            $definition = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+            }, $true)
+            if (-not $definition) { throw "$project missing $name." }
+            Invoke-Expression $definition.Extent.Text
+        }
+        $Yes = $true
+        $logDirectory = 'fixture'
+        $script:RestartRequired = $false
+        $script:Pending = $false
+        $script:CliPresent = $false
+        $script:CliWorks = $true
+        $script:InstallCli = $true
+        $script:PendingAfterInstall = $false
+        $script:InstallCalls = 0
+        $script:InstallerArguments = @()
+        function Write-InstallMessage { }
+        function Update-ProcessPath { }
+        function Test-RebootPending { return $script:Pending }
+        function Confirm-InstallAction { return $true }
+        function Get-Command {
+            param($Name)
+            if ($Name -eq 'copilot' -and $script:CliPresent) {
+                return [pscustomobject]@{ Source = 'fixture-copilot.exe' }
+            }
+        }
+        function Invoke-LoggedProcess {
+            if ($script:CliWorks) { return [pscustomobject]@{ ExitCode = 0; StandardOutput = '1.2.3'; CombinedOutput = '' } }
+            return [pscustomobject]@{ ExitCode = 1; StandardOutput = ''; CombinedOutput = '' }
+        }
+        function Get-Command { return [pscustomobject]@{ Source = 'fixture-winget.exe' } }
+        if (-not (Test-VmWinget)) { throw "$project did not accept a working WinGet." }
+        $script:CliWorks = $false
+        if (Test-VmWinget) { throw "$project accepted a failing WinGet executable." }
+        $script:CliWorks = $true
+        function Get-Command {
+            param($Name)
+            if ($Name -eq 'copilot' -and $script:CliPresent) {
+                return [pscustomobject]@{ Source = 'fixture-copilot.exe' }
+            }
+        }
+        function Invoke-VmInstaller {
+            param($Command, $Arguments)
+            $script:InstallCalls++
+            $script:InstallerArguments = $Arguments
+            if ($script:InstallCli) { $script:CliPresent = $true }
+            if ($script:PendingAfterInstall) { $script:Pending = $true }
+            return $true
+        }
+        $script:CliPresent = $true
+        if (-not (Install-VmCopilotCli) -or $script:InstallCalls -ne 0) {
+            throw "$project did not preserve a working Copilot CLI."
+        }
+        $script:CliPresent = $false
+        if (-not (Install-VmCopilotCli) -or $script:InstallCalls -ne 1 -or
+            $script:InstallerArguments -notcontains '--accept-package-agreements') {
+            throw "$project did not install and verify Copilot CLI with approved agreements."
+        }
+        $script:CliPresent = $false; $script:PendingAfterInstall = $true; $script:RestartRequired = $false
+        if ((Install-VmCopilotCli) -or -not $script:RestartRequired) {
+            throw "$project ignored a restart requested during package installation."
+        }
+        $script:Pending = $false; $script:PendingAfterInstall = $false; $script:RestartRequired = $false
+        $script:CliPresent = $false; $script:InstallCli = $false
+        $failed = $false
+        try { Install-VmCopilotCli | Out-Null }
+        catch { $failed = $_.Exception.Message -match 'Could not verify' }
+        if (-not $failed) { throw "$project accepted a missing Copilot CLI after installation." }
+        $script:CliPresent = $true; $script:CliWorks = $false
+        $failed = $false
+        try { Install-VmCopilotCli | Out-Null }
+        catch { $failed = $_.Exception.Message -match 'could not be verified' }
+        if (-not $failed) { throw "$project accepted a broken Copilot CLI." }
+        $script:Pending = $true; $script:RestartRequired = $false
+        if ((Install-VmCopilotCli) -or -not $script:RestartRequired) {
+            throw "$project ignored a pending Windows restart."
+        }
 
-    $PSNativeCommandUseErrorActionPreference = $true
-    $executable = (Get-Process -Id $PID).Path
-    $result = Invoke-WslCommand $executable @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
-        '[Console]::Error.WriteLine("WSL is not installed"); exit 42')
-    if ($result.Code -ne 42 -or $result.Text -notmatch 'WSL is not installed') {
-        throw 'A native WSL error did not preserve its exit code and diagnostic output.'
-    }
-    $result = Invoke-WslCommand $executable @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
-        '[Console]::Out.WriteLine("WSL ready"); exit 0')
-    if ($result.Code -ne 0 -or $result.Text -notmatch 'WSL ready') {
-        throw 'A successful native WSL command was not reported correctly.'
-    }
+        $script:PlatformReady = $false; $script:PlatformState = 'Disabled'
+        $script:RestartRequired = $false; $script:WslInstallCalls = 0
+        function Test-VmWslPlatform { return $script:PlatformReady }
+        function Get-VmWslExecutable { return 'fixture-wsl.exe' }
+        function Invoke-VmWindowsFeature { return [pscustomobject]@{ State = $script:PlatformState } }
+        function Invoke-VmInstaller {
+            param($Command, $Arguments)
+            if (($Arguments -join ' ') -ne '--install --no-distribution') { throw 'Unexpected WSL arguments.' }
+            $script:WslInstallCalls++
+            return $true
+        }
+        if ((Install-VmWslPlatform) -or -not $script:RestartRequired -or $script:WslInstallCalls -ne 1) {
+            throw "$project failed to stop for a required WSL restart."
+        }
+        $script:RestartRequired = $false; $script:PlatformState = 'EnablePending'
+        if ((Install-VmWslPlatform) -or -not $script:RestartRequired -or $script:WslInstallCalls -ne 1) {
+            throw "$project reinstalled a pending WSL platform."
+        }
+        $script:PlatformReady = $true
+        $script:DistroText = '* Ubuntu-24.04 Stopped 2'; $script:DistroCode = 0
+        function Invoke-ToolProbe { return [pscustomobject]@{ Code = $script:DistroCode; Text = $script:DistroText } }
+        if ((Get-VmUbuntuVersion) -ne 2 -or -not (Install-VmUbuntu)) {
+            throw "$project did not preserve an existing versioned Ubuntu on WSL2."
+        }
+        $script:DistroText = '* Ubuntu Stopped 1'
+        $failed = $false
+        try { Install-VmUbuntu | Out-Null }
+        catch { $failed = $_.Exception.Message -match 'WSL1' }
+        if (-not $failed) { throw "$project accepted an existing Ubuntu WSL1 installation." }
+        $script:DistroCode = 1; $script:DistroText = 'Access is denied.'
+        $failed = $false
+        try { Get-VmUbuntuVersion | Out-Null }
+        catch { $failed = $_.Exception.Message -match 'Access is denied' }
+        if (-not $failed) { throw "$project ignored a WSL distribution query failure." }
+        $script:PlatformReady = $false
+        if (Install-VmDocker) { throw "$project did not block Docker when WSL is unavailable." }
 
-    $script:WslReady = $false
-    $script:WslInstallCode = 0
-    $script:WslCalls = [Collections.Generic.List[string]]::new()
-    $script:RestartRequired = $false
-    function Get-WslExecutable { return 'fixture-wsl.exe' }
-    function Get-WindowsOptionalFeature { return [pscustomobject]@{ State = 'Enabled' } }
-    function Test-RebootPending { return $false }
-    function Confirm-InstallAction { return $true }
-    function Write-InstallMessage { }
-    function Invoke-WslCommand {
-        param($Executable, $Arguments)
-        $command = $Arguments -join ' '
-        $script:WslCalls.Add($command)
-        switch ($command) {
-            '--status' {
-                if ($script:WslReady) { return [pscustomobject]@{ Code = 0; Text = 'ready' } }
-                return [pscustomobject]@{ Code = 1; Text = 'The Windows Subsystem for Linux is not installed.' }
-            }
-            '--install --no-distribution' {
-                if ($script:WslInstallCode -eq 0) { $script:WslReady = $true }
-                return [pscustomobject]@{ Code = $script:WslInstallCode; Text = 'fixture installation error' }
-            }
-            '--list --verbose' {
-                return [pscustomobject]@{ Code = 1; Text = 'Windows Subsystem for Linux has no installed distributions.' }
-            }
-            '--install --distribution Ubuntu --no-launch' {
-                return [pscustomobject]@{ Code = $script:WslInstallCode; Text = 'fixture Ubuntu error' }
-            }
-            default { throw "Unexpected WSL command: $command" }
+        $script:Ownership = $false; $script:PathCalls = 0
+        $config = [pscustomobject]@{ root = (Join-Path ([IO.Path]::GetTempPath()) 'nvm-test/root') }
+        function Test-Path { return $true }
+        function Test-WorkshopNvmOwnership { return $script:Ownership }
+        function Set-RuntimePath { $script:PathCalls++ }
+        $failed = $false
+        try { Enable-VmNvmRuntimePath $config }
+        catch { $failed = $_.Exception.Message -match 'not safely managed' }
+        if (-not $failed -or $script:PathCalls -ne 0) {
+            throw "$project accepted an unmanaged Node runtime for PATH."
+        }
+        $script:Ownership = $true
+        Enable-VmNvmRuntimePath $config
+        if ($script:PathCalls -ne 1) { throw "$project did not prepare the managed Node runtime PATH." }
+
+        function Get-Command { return [pscustomobject]@{ Source = 'fixture-nvm.exe' } }
+        function Get-WorkshopReleaseVersion { return [version]'2.0.1' }
+        function Invoke-ToolProbe { return [pscustomobject]@{ Code = 0; Text = '{"auto_install":false}' } }
+        function Get-WorkshopNvmConfiguration { return [pscustomobject]@{ auto_install = $false } }
+        function Install-WorkshopNode {
+            param([switch]$Update, [switch]$LatestLts)
+            $script:LatestLtsRequested = $LatestLts -and $Update
+            return $true
+        }
+        function Test-VmNodeCommands { }
+        if (-not (Install-VmNvm -LatestLts) -or -not $script:LatestLtsRequested) {
+            throw "$project did not pass the latest LTS requirement to the shared Node installer."
+        }
+        if (-not (Install-VmNvm) -or $script:LatestLtsRequested) {
+            throw "$project changed the workshop default Node version policy."
         }
     }
-    if (-not (Install-WslPlatform) -or
-        ($script:WslCalls -join ',') -cne '--status,--install --no-distribution,--status') {
-        throw 'Missing WSL did not reach the platform installer and subsequent readiness check.'
+}
+
+foreach ($project in @('agent-box', 'appmod-box')) {
+    & {
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $RepositoryRoot "$project/scripts/install-vm-tools.ps1"), [ref]$tokens, [ref]$errors)
+        $definition = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-VmInstaller'
+        }, $true)
+        Invoke-Expression $definition.Extent.Text
+        $logDirectory = 'fixture'
+        function Get-Command { return [pscustomobject]@{ Source = 'fixture.exe' } }
+        function Write-InstallMessage { }
+        function Invoke-LoggedProcess {
+            return [pscustomobject]@{ ExitCode = $script:ExitCode; CombinedOutput = 'fixture diagnostics' }
+        }
+        foreach ($code in @([uint32]3010, [Convert]::ToUInt32('8A150109', 16),
+                [Convert]::ToUInt32('8A15010A', 16))) {
+            $script:ExitCode = $code; $script:RestartRequired = $false
+            if (-not (Invoke-VmInstaller fixture @()) -or -not $script:RestartRequired) {
+                throw "$project did not preserve restart exit code $code."
+            }
+        }
+        $script:ExitCode = 42; $script:RestartRequired = $false; $failed = $false
+        try { Invoke-VmInstaller fixture @() | Out-Null }
+        catch { $failed = $_.Exception.Message -match 'exit code 42.*fixture diagnostics' }
+        if (-not $failed) { throw "$project discarded native installation diagnostics." }
     }
-    if ((Get-UbuntuWslVersion) -ne 0) { throw 'An empty WSL distribution list was not accepted.' }
-    $script:WslReady = $false
-    $script:WslInstallCode = 42
-    $failed = $false
-    try { Install-WslPlatform | Out-Null }
-    catch { $failed = $_.Exception.Message -match 'exit code 42.*fixture installation error' }
-    if (-not $failed) { throw 'A WSL installation failure did not report its exit code and diagnostics.' }
-    $script:WslInstallCode = 3010
-    if ((Install-WslPlatform) -or -not $script:RestartRequired) {
-        throw 'A WSL restart-required exit code was not preserved.'
+}
+
+foreach ($project in @('agent-box', 'appmod-box')) {
+    & {
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $RepositoryRoot "$project/scripts/install-vm-tools.ps1"), [ref]$tokens, [ref]$errors)
+        foreach ($name in @('Install-WorkshopNode', 'Get-WorkshopReleaseVersion')) {
+            $definition = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+            }, $true)
+            Invoke-Expression $definition.Extent.Text
+        }
+        $Yes = $true
+        $script:SelectedPolicy = ''
+        $script:NodeCommandType = 'Application'
+        function Update-ProcessPath { }
+        function Write-InstallMessage { }
+        function Get-Command {
+            param($Name)
+            $type = if ($Name -eq 'node') { $script:NodeCommandType } else { 'Application' }
+            return [pscustomobject]@{ CommandType = $type; Source = "fixture-$Name.exe" }
+        }
+        function Test-WorkshopNvmOwnership { return $true }
+        function Get-WorkshopNvmConfiguration {
+            return [pscustomobject]@{ root = (Join-Path ([IO.Path]::GetTempPath()) 'nvm-test/root'); mode = 'shim' }
+        }
+        function Get-WorkshopNvmSelection { return [pscustomobject]@{ Version = [version]'22.1.0'; IsEmpty = $false } }
+        function Invoke-ToolProbe {
+            param($Name, $Arguments)
+            if ($Name -eq 'nvm') { return [pscustomobject]@{ Code = 0; Text = '2.0.1' } }
+            return [pscustomobject]@{ Code = 0; Text = 'v22.1.0' }
+        }
+        function Get-LatestNodeLts {
+            $script:SelectedPolicy = 'lts'
+            return [pscustomobject]@{ Version = '24.2.0'; Lts = 'fixture' }
+        }
+        function Get-WorkshopNodeRelease {
+            param($Major)
+            $script:SelectedPolicy = "major:$Major"
+            return [version]'22.2.0'
+        }
+        function Test-Path { return $false }
+        function Confirm-InstallAction { return $false }
+        if (-not (Install-WorkshopNode -Update -LatestLts) -or $script:SelectedPolicy -ne 'lts') {
+            throw "$project did not select the latest LTS for Agent Box."
+        }
+        if (-not (Install-WorkshopNode -Update) -or $script:SelectedPolicy -ne 'major:22') {
+            throw "$project did not preserve the workshop Node major policy."
+        }
+        $script:NodeCommandType = 'Alias'; $script:SelectedPolicy = ''; $failed = $false
+        try { Install-WorkshopNode -Update -LatestLts | Out-Null }
+        catch { $failed = $_.Exception.Message -match 'existing node command' }
+        if (-not $failed -or $script:SelectedPolicy) {
+            throw "$project did not reject a Node alias before selecting or installing a runtime."
+        }
     }
-    $script:RestartRequired = $false
-    $script:WslReady = $true
-    $script:WslInstallCode = 42
-    $failed = $false
-    try { Install-UbuntuWsl | Out-Null }
-    catch { $failed = $_.Exception.Message -match 'exit code 42.*fixture Ubuntu error' }
-    if (-not $failed) { throw 'An Ubuntu installation failure did not report its exit code and diagnostics.' }
 }
 
 & {
@@ -174,7 +382,7 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
-    foreach ($name in @('Initialize-AgentPowerShell', 'Invoke-VmPowerShell', 'Get-LatestPowerShell7Version')) {
+    foreach ($name in @('Install-VmPowerShell', 'Invoke-VmPowerShell', 'Get-VmWingetVersion', 'Test-VmPowerShell7')) {
         $definition = $ast.Find({
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -188,9 +396,10 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     function Find-VmPowerShell {
         if ($script:PowerShellReady) { return (Get-Process -Id $PID).Path }
     }
-    function Install-DevToolPackages {
-        param($WinGetExecutable, $LogDirectory, $Group)
-        if ($Group -ne 'Prerequisites') { throw 'Unexpected bootstrap package group.' }
+    function Install-VmPackage {
+        param($Id, $Name, $VersionPattern, $TestInstalled)
+        if ($Id -ne 'Microsoft.PowerShell') { throw 'Unexpected bootstrap package.' }
+        if (& $TestInstalled) { return $true }
         $script:PowerShellInstalls++
         if (-not $script:PowerShellInstallResult) { return $false }
         $script:PowerShellReady = $true
@@ -200,25 +409,27 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     function Test-InstallInteractive { return $false }
     $Yes = $true
     $script:PowerShellVersions = "8.0.0`n7.4.10`n7.5.2`n7.6.0-preview.1"
+    function Get-Command { return [pscustomobject]@{ Source = 'fixture-winget' } }
     function Invoke-LoggedProcess {
         return [pscustomobject]@{ ExitCode = 0; StandardOutput = $script:PowerShellVersions }
     }
-    if ((Get-LatestPowerShell7Version -WinGetExecutable winget -LogDirectory temp) -ne '7.5.2') {
+    $logDirectory = 'temp'
+    if ((Get-VmWingetVersion Microsoft.PowerShell '^7\.\d+\.\d+(?:\.\d+)?$') -ne '7.5.2') {
         throw 'PowerShell bootstrap did not select the newest stable 7.x release.'
     }
     $script:PowerShellVersions = "8.0.0`n7.6.0-preview.1"
     $failed = $false
-    try { Get-LatestPowerShell7Version -WinGetExecutable winget -LogDirectory temp | Out-Null }
-    catch { $failed = $_.Exception.Message -match 'stable PowerShell 7.x version' }
+    try { Get-VmWingetVersion Microsoft.PowerShell '^7\.\d+\.\d+(?:\.\d+)?$' | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'No stable' }
     if (-not $failed) { throw 'PowerShell bootstrap accepted a preview or a non-7.x version.' }
     $script:PowerShellInstallResult = $false
-    if (Initialize-AgentPowerShell -WinGetExecutable winget -LogDirectory temp) {
+    if (Install-VmPowerShell) {
         throw 'A declined or restart-required PowerShell installation was reported as ready.'
     }
     $script:PowerShellInstallResult = $true
     $script:PowerShellInstalls = 0
-    if (-not (Initialize-AgentPowerShell -WinGetExecutable winget -LogDirectory temp) -or
-        -not (Initialize-AgentPowerShell -WinGetExecutable winget -LogDirectory temp) -or
+    if (-not (Install-VmPowerShell) -or
+        -not (Install-VmPowerShell) -or
         $script:PowerShellInstalls -ne 1) {
         throw 'PowerShell bootstrap did not install once and preserve an existing installation.'
     }
@@ -255,80 +466,8 @@ exit 37
 & {
     $tokens = $null
     $errors = $null
-    $ast = [Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
-    foreach ($name in @('Install-DevToolPackages', 'Test-CopilotCli')) {
-        $definition = $ast.Find({
-            param($node)
-            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
-        }, $true)
-        Invoke-Expression $definition.Extent.Text
-    }
-    $Yes = $true
-    $script:CliInstalled = $false
-    $script:CliRuns = $false
-    $script:CliQueryError = $false
-    $script:InstallCalls = 0
-    function Test-RebootPending { return $false }
-    function Update-ProcessPath { }
-    function Write-InstallMessage { }
-    function Confirm-InstallAction { return $true }
-    function Get-Command {
-        if ($script:CliRuns) { return [pscustomobject]@{ Source = 'fixture-copilot.exe' } }
-    }
-    function Invoke-LoggedProcess {
-        return [pscustomobject]@{ ExitCode = 0; StandardOutput = '1.2.3' }
-    }
-    function Invoke-WinGetCommand {
-        param($Executable, $Arguments, $LogDirectory)
-        if ($Arguments[2] -ne 'GitHub.Copilot') { return 0 }
-        if ($Arguments[0] -eq 'install') {
-            $script:InstallCalls++
-            $script:CliInstalled = $true
-            return 0
-        }
-        if ($script:CliQueryError -and $script:CliInstalled) { return 42 }
-        return [Convert]::ToUInt32('8A150014', 16)
-    }
-    $script:CliRuns = $true
-    if (-not (Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group GitHub) -or
-        $script:InstallCalls -ne 0) {
-        throw 'A working Copilot CLI not listed by WinGet was not preserved.'
-    }
-    $script:CliRuns = $false
-    $script:CliInstalled = $false
-    function Get-Command {
-        if ($script:CliInstalled) { return [pscustomobject]@{ Source = 'fixture-copilot.exe' } }
-    }
-    if (-not (Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group GitHub) -or
-        $script:InstallCalls -ne 1) {
-        throw 'A working Copilot CLI was not verified after WinGet omitted it from the list.'
-    }
-    $script:CliInstalled = $false
-    $script:CliQueryError = $true
-    $failed = $false
-    try { Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group GitHub | Out-Null }
-    catch { $failed = $_.Exception.Message -match 'was not verified after installation' }
-    if (-not $failed) { throw 'A WinGet query error was ignored during Copilot CLI verification.' }
-    $script:CliQueryError = $false
-    $script:CliInstalled = $false
-    function Invoke-LoggedProcess { return [pscustomobject]@{ ExitCode = 1; StandardOutput = '' } }
-    $failed = $false
-    try { Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group GitHub | Out-Null }
-    catch { $failed = $_.Exception.Message -match 'Copilot CLI.*could not be verified' }
-    if (-not $failed) { throw 'An invalid Copilot CLI executable was accepted.' }
-    $script:CliInstalled = $false
-    function Get-Command { }
-    $failed = $false
-    try { Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group GitHub | Out-Null }
-    catch { $failed = $_.Exception.Message -match 'was not verified after installation' }
-    if (-not $failed) { throw 'A missing Copilot CLI was accepted after WinGet installation.' }
-}
-
-& {
-    $tokens = $null
-    $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
-    foreach ($name in @('Confirm-InstallAction', 'Install-DevToolPackages')) {
+    foreach ($name in @('Confirm-InstallAction')) {
         $definition = $ast.Find({
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -364,96 +503,21 @@ exit 37
     $Yes = $true
     if (-not (Confirm-InstallAction 'Install a tool.')) { throw '-Yes did not approve the installation.' }
 
-    $queried = [Collections.Generic.List[string]]::new()
-    $wslReady = $true
-    $installation = [pscustomobject]@{ Enabled = $false; Installed = $false; Arguments = @() }
-    $script:PendingRestart = $false
-    $script:RestartAfterInstall = $false
-    function Test-RebootPending { return $script:PendingRestart }
-    function Test-WslPlatform { return $wslReady }
-    function Get-LatestPowerShell7Version { return '7.5.2' }
-    function Invoke-WinGetCommand {
-        param([string]$Executable, [string[]]$Arguments, [string]$LogDirectory)
-        if ($installation.Enabled -and $Arguments[0] -eq 'install') {
-            $installation.Arguments = $Arguments
-            $installation.Installed = $true
-            if ($script:RestartAfterInstall) { $script:PendingRestart = $true }
-            return 0
-        }
-        if ($Arguments[0] -ne 'list') { throw 'Unexpected WinGet installation in test.' }
-        $queried.Add($Arguments[2])
-        if ($installation.Enabled -and -not $installation.Installed) {
-            return [Convert]::ToUInt32('8A150014', 16)
-        }
-        return 0
-    }
-    $expectedGroups = [ordered]@{
-        Prerequisites = @('Microsoft.PowerShell')
-        Runtimes = @('Microsoft.DotNet.SDK.10', 'Microsoft.DotNet.SDK.11', 'astral-sh.uv')
-        Containers = @('Docker.DockerDesktop')
-        GitHub = @('Git.Git', 'GitHub.cli', 'GitHub.Copilot')
-        Azure = @('Microsoft.AzureCLI', 'Microsoft.Azd')
-        Editors = @('Microsoft.VisualStudioCode')
-    }
-    foreach ($group in $expectedGroups.Keys) {
-        $queried.Clear()
-        if (-not (Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group $group)) {
-            throw "Installed package group $group was not accepted."
-        }
-        if (($queried -join ',') -cne ($expectedGroups[$group] -join ',')) {
-            throw "Incorrect packages or order for group $group."
-        }
-    }
-    $wslReady = $false
-    $queried.Clear()
-    if ((Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group Containers) -or $queried.Count) {
-        throw 'Docker was not blocked when the WSL2 platform was unavailable.'
-    }
-    $installation.Enabled = $true
-    $queried.Clear()
-    if (-not (Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group Editors)) {
-        throw 'Missing editor package was not installed and verified.'
-    }
-    if (($queried -join ',') -cne 'Microsoft.VisualStudioCode,Microsoft.VisualStudioCode' -or
-        $installation.Arguments -notcontains '--accept-package-agreements' -or
-        $installation.Arguments -notcontains '--disable-interactivity') {
-        throw 'WinGet installation did not preserve the approved package and agreement handling.'
-    }
-    $installation.Installed = $false
-    if (-not (Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group Prerequisites) -or
-        $installation.Arguments -notcontains '--version' -or $installation.Arguments -notcontains '7.5.2') {
-        throw 'PowerShell bootstrap did not request the selected stable 7.x version.'
-    }
-    $wslReady = $true
-    $installation.Installed = $false
-    if (-not (Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group Containers)) {
-        throw 'Docker package was not installed and verified.'
-    }
-    $overrideIndex = [array]::IndexOf($installation.Arguments, '--override')
-    if ($overrideIndex -lt 0 -or $overrideIndex -ge ($installation.Arguments.Count - 1)) {
-        throw 'Docker installation did not supply an installer override.'
-    }
-    $script:DockerOverrideArgument = $installation.Arguments[$overrideIndex + 1]
-    $installation.Installed = $false
-    $script:RestartAfterInstall = $true
-    $script:RestartRequired = $false
-    if ((Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group Containers) -or
-        -not $script:RestartRequired) {
-        throw 'A pending restart after Docker installation was not reported.'
-    }
+
 }
 
 & {
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
-    $main = $ast.Find({
-        param($node)
-        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-            $node.Name -eq 'Invoke-VmToolInstallation'
-    }, $true)
-    if (-not $main) { throw 'Agent Box installation flow was not found.' }
-    Invoke-Expression $main.Extent.Text
+    foreach ($name in @('Invoke-VmInstallationSteps', 'Invoke-VmToolInstallation')) {
+        $main = $ast.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+        }, $true)
+        if (-not $main) { throw "Agent Box installation function $name was not found." }
+        Invoke-Expression $main.Extent.Text
+    }
     $events = [Collections.Generic.List[string]]::new()
     $messages = [Collections.Generic.List[string]]::new()
     $packageFailure = ''
@@ -461,22 +525,29 @@ exit 37
     function Write-InstallMessage { param([string]$Message) $messages.Add($Message) }
     function Update-ProcessPath { }
     function Test-RebootPending { return $false }
-    function Initialize-WinGet { param([string]$LogDirectory) $events.Add('winget'); return 'winget' }
-    function Install-DevToolPackages {
-        param([string]$WinGetExecutable, [string]$LogDirectory, [string]$Group)
-        $events.Add("packages:$Group")
-        if ($Group -eq 'Runtimes' -and $packageFailure) {
+    function Install-VmDotnetSdk {
+        param($Major)
+        $events.Add("sdk:$Major")
+        if ($Major -eq 10 -and $packageFailure) {
             if ($packageFailure -eq 'restart') { $script:RestartRequired = $true }
             return $false
         }
         return $true
     }
-    function Install-WslPlatform { $events.Add('wsl'); return $true }
-    function Test-WslPlatform { return $true }
-    function Install-UbuntuWsl { $events.Add('ubuntu'); return $true }
-    function Install-NvmForWindows { param([string]$LogDirectory) $events.Add('nvm'); return $true }
-    function Install-NodeRuntime {
-        param([string]$LogDirectory)
+    function Install-VmPackage { param($Id) $events.Add("package:$Id"); return $true }
+    function Install-VmWslPlatform { $events.Add('wsl'); return $true }
+    function Install-VmUbuntu { $events.Add('ubuntu'); return $true }
+    function Install-VmDocker { $events.Add('docker'); return $true }
+    function Install-VmGit { $events.Add('git'); return $true }
+    function Install-VmGitHubCli { $events.Add('gh'); return $true }
+    function Install-VmCopilotCli { $events.Add('copilot-cli'); return $true }
+    function Install-VmAzureCli { $events.Add('az'); return $true }
+    function Install-VmAzd { $events.Add('azd'); return $true }
+    function Install-VmVsCode { $events.Add('vscode'); return $true }
+    function Install-VmNvm {
+        param([switch]$LatestLts)
+        if (-not $LatestLts) { throw 'Agent Box must request the latest LTS.' }
+        $events.Add('nvm')
         $events.Add('node')
         if ($nodeFailure) { throw 'fixture Node failure' }
         return $true
@@ -487,15 +558,14 @@ exit 37
         return $true
     }
     function Install-CopilotApp { $events.Add('copilot-app'); return $true }
-    function Test-DevToolCommands { param([string]$LogDirectory) $events.Add('verification') }
     function Test-RuntimeCommands { param([string]$LogDirectory) $events.Add('runtime-verification') }
-    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14' -WinGetExecutable winget) -ne 0) {
+    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 0) {
         throw 'Agent Box installation did not report success.'
     }
     $expectedEvents = @(
-        'wsl', 'ubuntu', 'packages:Runtimes',
-        'nvm', 'node', 'python:3.14', 'packages:Containers', 'packages:GitHub',
-        'packages:Azure', 'packages:Editors', 'copilot-app', 'verification', 'runtime-verification'
+        'wsl', 'ubuntu', 'sdk:10', 'sdk:11', 'package:astral-sh.uv',
+        'nvm', 'node', 'python:3.14', 'docker', 'git', 'gh', 'copilot-cli',
+        'az', 'azd', 'vscode', 'copilot-app', 'runtime-verification'
     )
     if (($events -join ',') -cne ($expectedEvents -join ',')) {
         throw "Unexpected Agent Box installation order: $($events -join ',')."
@@ -510,18 +580,18 @@ exit 37
     $events.Clear()
     $messages.Clear()
     $nodeFailure = $true
-    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14' -WinGetExecutable winget) -ne 1 -or
+    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 1 -or
         $events -notcontains 'python:3.14' -or
-        -not ($messages | Where-Object { $_ -match '^\[FAIL\] Node\.js installation failed: fixture Node failure' })) {
+        -not ($messages | Where-Object { $_ -match '^\[FAIL\] nvm and Node\.js: fixture Node failure' })) {
         throw 'A Node.js failure prevented Python installation or was not reported.'
     }
     $nodeFailure = $false
     $packageFailure = 'restart'
-    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14' -WinGetExecutable winget) -ne 3010) {
+    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 3010) {
         throw 'Agent Box did not return the restart-required status.'
     }
     $packageFailure = 'incomplete'
-    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14' -WinGetExecutable winget) -ne 1) {
+    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 1) {
         throw 'Agent Box did not return an incomplete-installation status.'
     }
 }
@@ -531,7 +601,7 @@ exit 37
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
-    foreach ($name in @('Invoke-ToolCommand', 'Install-NodeRuntime', 'Install-PythonRuntime')) {
+    foreach ($name in @('Invoke-ToolCommand', 'Install-PythonRuntime')) {
         $definition = $ast.Find({
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -605,7 +675,6 @@ exit 37
         if ($CommandName -eq $defaultPython -and $Arguments[0] -eq '-c') { return $script:DefaultIdentity }
         return ''
     }
-    if (-not (Install-NodeRuntime -LogDirectory 'temp')) { throw 'Valid Node runtime was not accepted.' }
     if (-not (Install-PythonRuntime -PythonVersion '3.14' -LogDirectory 'temp')) {
         throw 'The uv-managed Python installation was not verified.'
     }
@@ -613,7 +682,6 @@ exit 37
         $calls -notcontains 'uv.exe python install 3.14 --default --no-config --no-progress' -or
         $calls -notcontains 'uv.exe python find cpython3.14 --managed-python --no-python-downloads --no-project --system --no-config' -or
         $calls -notcontains 'uv.exe python dir --bin --no-config' -or
-        $calls -notcontains "path $binDirectory node.exe" -or
         $calls -notcontains "path $binDirectory python.exe" -or
         $calls -notcontains "resolve python $defaultPython") {
         throw 'The latest Python 3.14 patch was not installed and located through uv.'
@@ -637,14 +705,6 @@ exit 37
         $calls -contains 'uv.exe python install 3.14 --default --no-config --no-progress') {
         throw 'A conflicting Python command did not stop default selection after managed installation.'
     }
-    $script:ConflictName = 'node'
-    $calls.Clear()
-    $failed = $false
-    try { Install-NodeRuntime -LogDirectory 'temp' | Out-Null }
-    catch { $failed = $_.Exception.Message -match 'fixture node conflict' }
-    if (-not $failed -or @($calls | Where-Object { $_ -like 'nvm.exe install *' -or $_ -like 'nvm.exe use *' }).Count -ne 0) {
-        throw 'A conflicting Node command did not prevent nvm installation or activation.'
-    }
     $script:ConflictName = ''
     $script:PersistentConflict = 'python.exe'
     $calls.Clear()
@@ -654,27 +714,6 @@ exit 37
     if (-not $failed -or $calls -contains 'uv.exe python install 3.14 --default --no-config --no-progress') {
         throw 'A persistent PATH conflict did not prevent default Python selection.'
     }
-    $script:PersistentConflict = 'node.exe'
-    $script:CurrentNode = $true
-    $calls.Clear()
-    $failed = $false
-    try { Install-NodeRuntime -LogDirectory 'temp' | Out-Null }
-    catch { $failed = $_.Exception.Message -match 'node.exe PATH conflict' }
-    if (-not $failed -or @($calls | Where-Object { $_ -like 'nvm.exe install *' -or $_ -like 'nvm.exe use *' }).Count) {
-        throw 'A persistent PATH conflict did not prevent Node installation or activation.'
-    }
-    $script:PersistentConflict = ''
-    $script:CurrentNode = $false
-    $script:NodeOutput = ''
-    $failed = $false
-    try { Install-NodeRuntime -LogDirectory 'temp' | Out-Null }
-    catch { $failed = $_.Exception.Message -match 'Node.js did not return runtime information' }
-    if (-not $failed) { throw 'An empty Node runtime response did not produce an actionable error.' }
-    $script:NodeOutput = 'null'
-    $failed = $false
-    try { Install-NodeRuntime -LogDirectory 'temp' | Out-Null }
-    catch { $failed = $_.Exception.Message -match 'Active Node.js does not match' }
-    if (-not $failed) { throw 'A null Node runtime response did not produce an actionable error.' }
 }
 
 & {
@@ -710,7 +749,7 @@ exit 37
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
-    foreach ($name in @('Assert-NoRuntimeCommandConflict', 'Test-RuntimePath', 'Set-RuntimePath', 'Get-NvmRuntimeDirectory', 'Assert-RuntimeCommand', 'Test-RuntimeCommands')) {
+    foreach ($name in @('Assert-NoRuntimeCommandConflict', 'Test-RuntimePath', 'Set-RuntimePath', 'Assert-RuntimeCommand', 'Test-RuntimeCommands', 'Test-VmNodeCommands')) {
         $definition = $ast.Find({
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -785,31 +824,6 @@ exit 37
         catch { $failed = $_.Exception.Message -match 'invalid' }
         if (-not $failed -or $writes.Count) { throw 'A missing runtime executable was accepted.' }
 
-        $env:NVM_SYMLINK = $preferred
-        if ((Get-NvmRuntimeDirectory -NvmVersion ([version]'1.2.0') -LogDirectory temp) -cne $preferred) {
-            throw 'NVM 1 runtime directory was not found from NVM_SYMLINK.'
-        }
-        function Invoke-ToolCommand { return ('{"root":"' + ($fixture -replace '\\', '\\') + '/nvm"}') }
-        $legacyRuntime = Join-Path $fixture '.nodejs'
-        $null = [IO.Directory]::CreateDirectory($legacyRuntime)
-        [IO.File]::WriteAllText((Join-Path $legacyRuntime 'node.exe'), '')
-        $env:LOCALAPPDATA = $fixture
-        if ((Get-NvmRuntimeDirectory -NvmVersion ([version]'2.0.0') -LogDirectory temp) -cne (Join-Path $fixture '.nodejs')) {
-            throw 'NVM 2 runtime directory was not derived from its root.'
-        }
-        $userRuntime = Join-Path $fixture 'Author Software/nvm/.nodejs'
-        $null = [IO.Directory]::CreateDirectory($userRuntime)
-        [IO.File]::WriteAllText((Join-Path $userRuntime 'node.exe'), '')
-        $env:Path = $userRuntime
-        if ((Get-NvmRuntimeDirectory -NvmVersion ([version]'2.0.0') -LogDirectory temp) -cne $userRuntime) {
-            throw 'The nvm runtime on PATH was not selected when multiple candidates exist.'
-        }
-        $env:Path = "$legacyRuntime;$userRuntime"
-        $failed = $false
-        try { Get-NvmRuntimeDirectory -NvmVersion ([version]'2.0.0') -LogDirectory temp | Out-Null }
-        catch { $failed = $_.Exception.Message -match 'PATH ambiguity' }
-        if (-not $failed) { throw 'Ambiguous nvm runtime directories were accepted.' }
-        $env:Path = $originalPath
         $script:CommandFixture = [pscustomobject]@{ CommandType = 'Application'; Source = (Join-Path $preferred 'python.exe') }
         function Get-Command { return $script:CommandFixture }
         Assert-RuntimeCommand -Name python -ExpectedPath (Join-Path $preferred 'python.exe')
@@ -825,8 +839,7 @@ exit 37
 
         $npmPath = Join-Path $preferred 'npm.ps1'
         [IO.File]::WriteAllText($npmPath, "Write-Output '1.2.3'; `$global:LASTEXITCODE = 0")
-        function Get-NvmVersion { return '2.0.0' }
-        function Get-NvmRuntimeDirectory { return $preferred }
+        function Test-WorkshopNvmOwnership { return $true }
         function Invoke-ToolCommand { return $preferred }
         function Get-Command {
             param($Name)
@@ -834,11 +847,18 @@ exit 37
             return [pscustomobject]@{ CommandType = 'Application'; Source = (Join-Path $preferred "$Name.exe") }
         }
         Test-RuntimeCommands -LogDirectory temp
+        Test-VmNodeCommands
         $npmPath = Join-Path $other 'npm.ps1'
         $failed = $false
-        try { Test-RuntimeCommands -LogDirectory temp }
+        try { Test-VmNodeCommands }
         catch { $failed = $_.Exception.Message -match 'npm does not resolve' }
         if (-not $failed) { throw 'An npm command outside the nvm runtime was accepted.' }
+        $npmPath = Join-Path $preferred 'npm.ps1'
+        [IO.File]::WriteAllText($npmPath, "Write-Output 'invalid'; `$global:LASTEXITCODE = 0")
+        $failed = $false
+        try { Test-VmNodeCommands }
+        catch { $failed = $_.Exception.Message -match 'npm command could not be verified' }
+        if (-not $failed) { throw 'An invalid npm command was accepted.' }
     }
     finally {
         $env:AGENTBOX_PATH_FIXTURE = $originalFixtureEnv
@@ -858,7 +878,7 @@ exit 37
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
     $definition = $ast.Find({
         param($node)
-        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Install-NvmForWindows'
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Install-VmNvm'
     }, $true)
     Invoke-Expression $definition.Extent.Text
     $originalNvmHome = $env:NVM_HOME
@@ -867,7 +887,7 @@ exit 37
     try {
         $env:NVM_HOME = ''
         $env:NVM_SYMLINK = ''
-        $env:ProgramFiles = ''
+        $env:ProgramFiles = [IO.Path]::GetTempPath()
         $script:ExistingNode = $true
         function Update-ProcessPath { }
         function Get-Command {
@@ -879,8 +899,8 @@ exit 37
             $script:ExistingNode = $case -eq 'command'
             if ($case -eq 'nvm-path') { $env:NVM_HOME = 'existing-nvm-home' }
             $failed = $false
-            try { Install-NvmForWindows -LogDirectory temp | Out-Null }
-            catch { $failed = $_.Exception.Message -match 'resolve the conflict manually' }
+            try { Install-VmNvm | Out-Null }
+            catch { $failed = $_.Exception.Message -match 'Preserving the existing' }
             if (-not $failed) { throw "NVM installation did not preserve the existing $case." }
         }
     }
@@ -1123,9 +1143,7 @@ exit 37
                     throw "$project command logs did not preserve arguments, streams, or the exit code (streaming=$streaming)."
                 }
                 if ($streaming) {
-                    $dockerOverride = if ($project -eq 'agent-box') {
-                        $script:DockerOverrideArgument
-                    } else { $script:AppmodDockerOverrideArgument }
+                    $dockerOverride = $script:AppmodDockerOverrideArgument
                     $dockerResult = Invoke-LoggedProcess -Executable $executable -Arguments @(
                         '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $fixture, $dockerOverride
                     ) -LogDirectory $logDirectory -StreamOutput -Quiet
@@ -1139,7 +1157,7 @@ exit 37
         $tokens = $null
         $errors = $null
         $ast = [Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
-        foreach ($name in @('Invoke-LoggedProcess', 'Invoke-WinGetCommand')) {
+        foreach ($name in @('Invoke-LoggedProcess', 'Invoke-VmInstaller')) {
             $definition = $ast.Find({
                 param($node)
                 $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -1148,12 +1166,17 @@ exit 37
         }
         $logDirectory = Join-Path $temporary 'agent-winget'
         $null = New-Item -ItemType Directory -Path $logDirectory
-        $code = Invoke-WinGetCommand -Executable $executable -Arguments @(
-            '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $fixture, $script:DockerOverrideArgument
-        ) -LogDirectory $logDirectory
+        function Get-Command { return [pscustomobject]@{ Source = $executable } }
+        $failed = $false
+        try {
+            Invoke-VmInstaller fixture @(
+                '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $fixture, $script:AppmodDockerOverrideArgument
+            ) | Out-Null
+        }
+        catch { $failed = $_.Exception.Message -match 'exit code 37' }
         $output = Get-ChildItem -LiteralPath $logDirectory -Filter 'command-*.stdout.log' |
             Get-Content -Raw
-        if ($code -ne 37 -or $output.Trim() -cne 'stdout:install --backend=wsl-2') {
+        if (-not $failed -or $output.Trim() -cne 'stdout:install --backend=wsl-2') {
             throw 'Agent WinGet invocation did not pass the Docker override as one process argument.'
         }
     }
@@ -1174,8 +1197,8 @@ exit 37
         $mocks = @'
 function Assert-VmInstallerContext { }
 function Test-RebootPending { return $false }
-function Initialize-WinGet { return 'fixture-winget' }
-function Initialize-AgentPowerShell {
+function Initialize-VmWinget { return $true }
+function Install-VmPowerShell {
     if ($env:AGENTBOX_BOOTSTRAP_TEST_MODE -eq 'restart') {
         $script:RestartRequired = $true
         return $false
@@ -1184,8 +1207,8 @@ function Initialize-AgentPowerShell {
     return $true
 }
 function Invoke-VmToolInstallation {
-    param($LogDirectory, $PythonVersion, $WinGetExecutable)
-    Write-InstallMessage "[PASS] fixture Python=$PythonVersion winget=$WinGetExecutable"
+    param($LogDirectory, $PythonVersion)
+    Write-InstallMessage "[PASS] fixture Python=$PythonVersion"
     return 0
 }
 
@@ -1197,7 +1220,7 @@ function Invoke-VmToolInstallation {
             $output = & pwsh -NoLogo -NoProfile -NonInteractive -File $fixture -Yes -PythonVersion 3.13 2>&1 | Out-String
             $expected = if ($mode -eq 'success') { 0 } elseif ($mode -eq 'declined') { 1 } elseif ($IsWindows) { 3010 } else { 3010 % 256 }
             if ($LASTEXITCODE -ne $expected -or $output -notmatch 'Installation logs:' -or
-                ($mode -eq 'success' -and $output -notmatch 'fixture Python=3\.13 winget=fixture-winget')) {
+                ($mode -eq 'success' -and $output -notmatch 'fixture Python=3\.13')) {
                 throw "Agent Box bootstrap entry fixture failed ($mode): $output"
             }
         }

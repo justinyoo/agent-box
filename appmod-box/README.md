@@ -127,6 +127,8 @@ azd의 최초 지역 선택 목록은 Bastion Developer와 기본 VM 이미지�
 
 PostgreSQL 18 클라이언트 설치 후 PATH 변경을 반영하려면 Windows Terminal을 완전히 종료하고 다시 여세요. `psql --version`을 실행해 18.x 버전이 표시되는지 확인하세요.
 
+Node.js 경로가 PATH에 없으면 충돌 여부를 확인한 뒤 동의를 받아 사용자 PATH 끝에 추가합니다. 기존 PATH 순서는 변경하지 않습니다.
+
 ### 설치 후 수동 작업
 
 1. Docker Desktop을 시작해 약관과 WSL2 설정을 확인하고 Linux 컨테이너를 사용하세요.

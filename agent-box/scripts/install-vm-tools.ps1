@@ -168,17 +168,6 @@ function Invoke-LoggedProcess {
 }
 
 # Tool setup and verification.
-function Invoke-WinGetCommand {
-    param(
-        [string]$Executable,
-        [string[]]$Arguments,
-        [string]$LogDirectory
-    )
-
-    $result = Invoke-LoggedProcess @PSBoundParameters -StreamOutput
-    return $result.ExitCode
-}
-
 function Invoke-ToolCommand {
     param(
         [string]$CommandName,
@@ -401,73 +390,6 @@ function Set-RuntimePath {
     Update-ProcessPath
 }
 
-function Initialize-WinGet {
-    param([string]$LogDirectory)
-
-    $command = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($null -ne $command) {
-        $code = Invoke-WinGetCommand -Executable $command.Source -Arguments @('--version') `
-            -LogDirectory $LogDirectory
-        if ($code -eq 0) {
-            return $command.Source
-        }
-        Write-InstallMessage ('[WARN] WinGet is not ready (0x{0:X8}); attempting the documented bootstrap.' -f $code)
-    }
-
-    Write-InstallMessage '[INFO] Preparing WinGet for the signed-in administrator.'
-    if (-not (Confirm-InstallAction 'Install or repair WinGet and its Microsoft.WinGet.Client prerequisites.')) {
-        throw 'WinGet setup was declined; no remaining tools can be installed.'
-    }
-    $originalTls = [Net.ServicePointManager]::SecurityProtocol
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = $originalTls -bor [Net.SecurityProtocolType]::Tls12
-        if (-not (Get-Module -ListAvailable -Name Microsoft.WinGet.Client)) {
-            $nuget = Get-PackageProvider -ListAvailable -ErrorAction Stop |
-                Where-Object { $_.Name -eq 'NuGet' -and $_.Version -ge [version]'2.8.5.201' }
-            if (-not $nuget) {
-                Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 `
-                    -Scope AllUsers -Force -ErrorAction Stop | Out-Null
-            }
-            Install-Module -Name Microsoft.WinGet.Client -Repository PSGallery `
-                -Scope AllUsers -Force -ErrorAction Stop
-        }
-        Import-Module Microsoft.WinGet.Client -ErrorAction Stop
-        Repair-WinGetPackageManager -AllUsers -Latest -ErrorAction Stop | Out-Null
-    }
-    finally {
-        [Net.ServicePointManager]::SecurityProtocol = $originalTls
-    }
-
-    Update-ProcessPath
-    $command = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($null -eq $command) {
-        throw 'WinGet is still unavailable. Check App Installer registration and organizational policy, then rerun in an elevated user session.'
-    }
-    $code = Invoke-WinGetCommand -Executable $command.Source -Arguments @('--version') `
-        -LogDirectory $LogDirectory
-    if ($code -ne 0) {
-        throw ('WinGet bootstrap did not produce a working client (0x{0:X8}). See {1}.' -f $code, $LogDirectory)
-    }
-    return $command.Source
-}
-
-function Get-LatestPowerShell7Version {
-    param([string]$WinGetExecutable, [string]$LogDirectory)
-
-    $arguments = @('show', '--id', 'Microsoft.PowerShell', '--exact', '--source', 'winget', '--versions', '--disable-interactivity')
-    if ($Yes) { $arguments += '--accept-source-agreements' }
-    $result = Invoke-LoggedProcess -Executable $WinGetExecutable -Arguments $arguments -LogDirectory $LogDirectory -StreamOutput
-    if ($result.ExitCode -ne 0) { throw "Could not query PowerShell versions. See $LogDirectory." }
-    $versions = @(([string]$result.StandardOutput -split '\r?\n') |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { $_ -match '^7\.\d+\.\d+(?:\.\d+)?$' } |
-        ForEach-Object { [version]$_ } | Sort-Object -Descending)
-    if (-not $versions.Count) { throw 'WinGet did not return a stable PowerShell 7.x version.' }
-    return $versions[0].ToString()
-}
-
 function Test-CopilotCli {
     param([string]$LogDirectory)
 
@@ -483,321 +405,220 @@ function Test-CopilotCli {
     return $true
 }
 
-function Install-DevToolPackages {
-    param(
-        [string]$WinGetExecutable,
-        [string]$LogDirectory,
-        [Parameter(Mandatory)]
-        [ValidateSet('Prerequisites', 'Runtimes', 'Containers', 'GitHub', 'Azure', 'Editors')]
-        [string]$Group
-    )
-
-    $packages = @(
-        @{ Group = 'Prerequisites'; Id = 'Microsoft.PowerShell'; Name = 'PowerShell 7'; Extra = @('--installer-type', 'wix') }
-        @{ Group = 'Runtimes'; Id = 'Microsoft.DotNet.SDK.10'; Name = '.NET 10 SDK'; Extra = @() }
-        @{ Group = 'Runtimes'; Id = 'Microsoft.DotNet.SDK.11'; Name = '.NET 11 SDK'; Extra = @() }
-        @{ Group = 'Runtimes'; Id = 'astral-sh.uv'; Name = 'uv'; Extra = @() }
-        @{ Group = 'Containers'; Id = 'Docker.DockerDesktop'; Name = 'Docker Desktop (WSL2 backend)'; Extra = @('--override', 'install --backend=wsl-2') }
-        @{ Group = 'GitHub'; Id = 'Git.Git'; Name = 'Git'; Extra = @() }
-        @{ Group = 'GitHub'; Id = 'GitHub.cli'; Name = 'GitHub CLI'; Extra = @() }
-        @{ Group = 'GitHub'; Id = 'GitHub.Copilot'; Name = 'GitHub Copilot CLI'; Extra = @() }
-        @{ Group = 'Azure'; Id = 'Microsoft.AzureCLI'; Name = 'Azure CLI'; Extra = @() }
-        @{ Group = 'Azure'; Id = 'Microsoft.Azd'; Name = 'Azure Developer CLI'; Extra = @() }
-        @{ Group = 'Editors'; Id = 'Microsoft.VisualStudioCode'; Name = 'Visual Studio Code'; Extra = @() }
-    )
-    $notInstalled = [Convert]::ToUInt32('8A150014', 16)
-    $alreadyInstalled = @('8A15002B', '8A150061', '8A15010D') |
-        ForEach-Object { [Convert]::ToUInt32($_, 16) }
-    $rebootRequired = @([uint32]1641, [uint32]3010) + @(
-        '8A150109', '8A15010A' | ForEach-Object { [Convert]::ToUInt32($_, 16) }
-    )
-
-    $complete = $true
-    foreach ($package in $packages) {
-        if ($package.Group -ne $Group) { continue }
-        if (Test-RebootPending) {
-            $script:RestartRequired = $true
-            Write-InstallMessage '[MANUAL] A Windows restart is pending. Restart manually and rerun this script.'
-            return $false
-        }
-        $id = $package.Id
-        if ($id -eq 'Docker.DockerDesktop' -and -not (Test-WslPlatform)) {
-            Write-InstallMessage '[MANUAL] Docker Desktop is waiting for a ready WSL2 platform.'
-            $complete = $false
-            continue
-        }
-        $query = @('list', '--id', $id, '--exact', '--source', 'winget')
-        if ($Yes) {
-            $query += @('--accept-source-agreements', '--disable-interactivity')
-        }
-        $code = Invoke-WinGetCommand -Executable $WinGetExecutable -Arguments $query `
-            -LogDirectory $LogDirectory
-        if ($code -eq 0) {
-            Write-InstallMessage "[PASS] $($package.Name) is installed. Keeping the existing installation."
-            continue
-        }
-        if ($code -ne $notInstalled) {
-            throw ('Cannot determine whether {0} is installed (0x{1:X8}). See {2}.' -f $id, $code, $LogDirectory)
-        }
-        if ($id -eq 'GitHub.Copilot' -and (Test-CopilotCli -LogDirectory $LogDirectory)) {
-            Write-InstallMessage '[WARN] WinGet did not list GitHub Copilot CLI, but its executable was verified. Keeping the existing installation.'
-            continue
-        }
-        if (-not (Confirm-InstallAction "Install $($package.Name) with WinGet and accept its package agreements.")) {
-            Write-InstallMessage "[MANUAL] Skipped the $($package.Name) installation."
-            $complete = $false
-            continue
-        }
-
-        $arguments = @(
-            'install', '--id', $id, '--exact', '--source', 'winget', '--scope', 'machine',
-            '--architecture', 'x64', '--silent', '--no-upgrade',
-            '--accept-source-agreements', '--accept-package-agreements', '--disable-interactivity'
-        )
-        if ($id -eq 'Microsoft.PowerShell') {
-            $arguments += @('--version', (Get-LatestPowerShell7Version -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory))
-        }
-        $arguments += $package.Extra
-
-        $code = Invoke-WinGetCommand -Executable $WinGetExecutable -Arguments $arguments `
-            -LogDirectory $LogDirectory
-        if ($rebootRequired -contains $code) {
-            $script:RestartRequired = $true
-            Write-InstallMessage "[MANUAL] $($package.Name) requires a manual restart. Restart Windows, then run this script again."
-            return $false
-        }
-        if ($code -ne 0 -and $alreadyInstalled -notcontains $code) {
-            throw ('Installation of {0} failed (0x{1:X8}). See {2}.' -f $id, $code, $LogDirectory)
-        }
-        if (Test-RebootPending) {
-            $script:RestartRequired = $true
-            Write-InstallMessage '[MANUAL] A Windows restart is pending. Restart manually and rerun this script.'
-            return $false
-        }
-
-        $code = Invoke-WinGetCommand -Executable $WinGetExecutable -Arguments $query `
-            -LogDirectory $LogDirectory
-        if ($code -ne 0) {
-            if ($id -eq 'GitHub.Copilot' -and $code -eq $notInstalled -and
-                (Test-CopilotCli -LogDirectory $LogDirectory)) {
-                Write-InstallMessage '[WARN] WinGet did not list GitHub Copilot CLI after installation, but its executable was verified.'
-                continue
-            }
-            throw ('{0} was not verified after installation (0x{1:X8}). See {2}.' -f $id, $code, $LogDirectory)
-        }
-        Write-InstallMessage "[PASS] Verified the $($package.Name) installation."
-    }
-    return $complete
+function Invoke-ToolProbe {
+    param([string]$Name, [string[]]$Arguments = @())
+    $command = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $command) { return [pscustomobject]@{ Code = 127; Text = '' } }
+    $result = Invoke-LoggedProcess -Executable $command.Source -Arguments $Arguments `
+        -LogDirectory $logDirectory -StreamOutput -Quiet
+    return [pscustomobject]@{ Code = $result.ExitCode; Text = $result.CombinedOutput.Trim() }
 }
 
-function Initialize-AgentPowerShell {
-    param([string]$WinGetExecutable, [string]$LogDirectory)
+function Test-MinimumVersion {
+    param([string]$Text, [version]$Minimum)
+    $match = [regex]::Match($Text, '(?<!\d)(\d+\.\d+\.\d+)(?![\d-])')
+    return $match.Success -and ([version]$match.Groups[1].Value -ge $Minimum)
+}
 
-    if (Find-VmPowerShell) {
-        Write-InstallMessage '[PASS] PowerShell 7.x is installed. Keeping the existing installation.'
+function Invoke-VmInstaller {
+    param([string]$Command, [string[]]$Arguments)
+    $executable = Get-Command $Command -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $result = Invoke-LoggedProcess -Executable $executable.Source -Arguments $Arguments `
+        -LogDirectory $logDirectory -StreamOutput
+    $code = $result.ExitCode
+    if ($code -in @([uint32]1641, [uint32]3010,
+            [Convert]::ToUInt32('8A150109', 16), [Convert]::ToUInt32('8A15010A', 16))) {
+        $script:RestartRequired = $true
+        Write-InstallMessage '[MANUAL] The installer requested a restart. Restart manually and rerun this script.'
         return $true
     }
-    if (-not (Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Prerequisites)) {
-        return $false
-    }
-    if (-not (Find-VmPowerShell)) {
-        throw 'PowerShell 7.x could not be verified after installation. Open a new terminal and rerun.'
-    }
+    if ($code -ne 0) { throw "$Command installation failed (exit code $code): $($result.CombinedOutput)" }
     return $true
 }
 
-function Get-NvmVersion {
-    param([string]$LogDirectory)
-
-    $output = Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments @('version') `
-        -LogDirectory $LogDirectory
-    # NVM 2 prefixes the version with "v" and can append an edition notice.
-    if ($output -notmatch '^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\r?\n|$)') {
-        throw "NVM did not report a recognizable version. See $LogDirectory."
+function Get-VmWingetVersion {
+    param([string]$Id, [string]$VersionPattern)
+    $arguments = @('show', '--id', $Id, '--exact', '--source', 'winget', '--versions', '--disable-interactivity')
+    if ($Yes) { $arguments += '--accept-source-agreements' }
+    $executable = Get-Command winget -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $result = Invoke-LoggedProcess -Executable $executable.Source -Arguments $arguments `
+        -LogDirectory $logDirectory -StreamOutput
+    if ($result.ExitCode -ne 0) {
+        throw "Failed to query $Id versions. Check the source agreements and network access in winget: $($result.CombinedOutput)"
     }
-    return $Matches[1]
+    $versions = @($result.StandardOutput -split '\r?\n' | ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -match $VersionPattern } | ForEach-Object { [version]$_ } | Sort-Object -Descending)
+    if (-not $versions.Count) { throw "No stable $Id version matches the required pattern: $VersionPattern" }
+    return $versions[0].ToString()
 }
 
-function Get-LatestNvmRelease {
-    $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/nvm-windows/nvm/releases/latest' `
-        -Headers @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } `
-        -UserAgent 'AgentBox-DevTools' -TimeoutSec 60 -ErrorAction Stop
-    if ($null -eq $release -or
-        -not $release.PSObject.Properties['draft'] -or
-        -not $release.PSObject.Properties['prerelease'] -or
-        -not $release.PSObject.Properties['tag_name'] -or
-        -not $release.PSObject.Properties['assets'] -or
-        $release.draft -isnot [bool] -or $release.prerelease -isnot [bool] -or
-        $release.draft -or $release.prerelease -or
-        $release.tag_name -notmatch '^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$') {
-        throw 'GitHub did not return valid stable NVM release metadata.'
-    }
-    $version = $Matches[1]
-    $assetName = "nvm-$version-x64-setup.exe"
-    $assets = @($release.assets | Where-Object {
-        $_.PSObject.Properties['name'] -and $_.name -ceq $assetName
-    })
-    if ($assets.Count -ne 1) {
-        throw "NVM $version must have exactly one $assetName release asset."
-    }
-    $asset = $assets[0]
-    $expectedUrl = "https://github.com/nvm-windows/nvm/releases/download/$($release.tag_name)/$assetName"
-    if (-not $asset.PSObject.Properties['browser_download_url'] -or
-        $asset.browser_download_url -cne $expectedUrl -or
-        -not $asset.PSObject.Properties['digest'] -or
-        $asset.digest -notmatch '^sha256:([a-fA-F0-9]{64})$') {
-        throw "NVM $version has an invalid installer URL or SHA-256 digest."
-    }
-    return [pscustomobject]@{
-        Version = $version
-        DownloadUrl = $expectedUrl
-        Sha256 = $Matches[1]
-    }
-}
-
-function Install-NvmForWindows {
-    param([string]$LogDirectory)
-
-    Update-ProcessPath
-    $existing = Get-Command nvm.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($null -ne $existing) {
-        $version = Get-NvmVersion -LogDirectory $LogDirectory
-        Write-InstallMessage "[PASS] NVM $version is installed. Keeping the existing installation."
-        return $true
-    }
-    $defaultLink = if ($env:ProgramFiles) { Join-Path $env:ProgramFiles 'nodejs' }
-    if ((Get-Command node -ErrorAction SilentlyContinue) -or $env:NVM_HOME -or $env:NVM_SYMLINK -or
-        ($defaultLink -and (Test-Path -LiteralPath $defaultLink))) {
-        throw 'Existing Node.js or nvm paths were found without a usable nvm command. Preserve them and resolve the conflict manually before installing nvm.'
-    }
-    if (-not (Confirm-InstallAction 'Install nvm-windows from its latest stable GitHub x64 release.')) {
-        return $false
-    }
-
-    $installer = Join-Path $LogDirectory ('nvm-setup-{0}.exe' -f [guid]::NewGuid().ToString('N'))
-    $originalTls = [Net.ServicePointManager]::SecurityProtocol
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = $originalTls -bor [Net.SecurityProtocolType]::Tls12
-        $release = Get-LatestNvmRelease
-        Write-InstallMessage "[INFO] Installing NVM $($release.Version) from $($release.DownloadUrl)."
-        Invoke-WebRequest -Uri $release.DownloadUrl -OutFile $installer -UseBasicParsing `
-            -UserAgent 'AgentBox-DevTools' -TimeoutSec 180 -ErrorAction Stop | Out-Null
-        $hash = Get-FileHash -LiteralPath $installer -Algorithm SHA256 -ErrorAction Stop
-        if ($hash.Hash -ne $release.Sha256) {
-            throw 'NVM installer SHA-256 does not match its GitHub release digest.'
-        }
-        $signature = Get-AuthenticodeSignature -LiteralPath $installer -ErrorAction Stop
-        if ($signature.Status -ne 'Valid') {
-            throw "NVM installer Authenticode signature is not valid: $($signature.Status)."
-        }
-        $result = Invoke-LoggedProcess -Executable $installer -Arguments @(
-            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/SP-', '/CURRENTUSER',
-            '/NORESTART', '/RESTARTEXITCODE=3010', '/NOCLOSEAPPLICATIONS',
-            '/OFFICIALNODE=ignore', ('/LOG="{0}"' -f (Join-Path $LogDirectory 'nvm-setup.log'))
-        ) -LogDirectory $LogDirectory
-        if ($result.ExitCode -eq 3010) {
-            throw 'NVM requires a restart. Restart manually, sign in again, and rerun this script.'
-        }
-        if ($result.ExitCode -ne 0) {
-            throw ('NVM installation failed (0x{0:X8}). See {1}.' -f $result.ExitCode, $LogDirectory)
-        }
-        Update-ProcessPath
-        $installedVersion = Get-NvmVersion -LogDirectory $LogDirectory
-        if ($installedVersion -ne $release.Version) {
-            throw "NVM reports $installedVersion instead of $($release.Version). Check installer logs and PATH conflicts in $LogDirectory."
-        }
-        return $true
-    }
-    finally {
-        [Net.ServicePointManager]::SecurityProtocol = $originalTls
-        if (Test-Path -LiteralPath $installer -PathType Leaf) {
-            Remove-Item -LiteralPath $installer -Force -ErrorAction Stop
-        }
-    }
-}
-
-function Get-WslExecutable {
-    $command = Get-Command wsl.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($command) { return $command.Source }
-    $path = Join-Path $env:SystemRoot 'System32\wsl.exe'
-    if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
-}
-
-function Invoke-WslCommand {
-    param([string]$Executable, [string[]]$Arguments)
-
-    # A missing WSL installation reports status on stderr; inspect its exit code before deciding what to do.
-    $ErrorActionPreference = 'Continue'
-    $PSNativeCommandUseErrorActionPreference = $false
-    $global:LASTEXITCODE = $null
-    $text = (& $Executable @Arguments 2>&1 | Out-String) -replace "`0", ''
-    if ($null -eq $LASTEXITCODE) { throw "$Executable did not return an exit code." }
-    return [pscustomobject]@{ Code = $LASTEXITCODE; Text = $text.Trim() }
-}
-
-function Test-WslPlatform {
-    $wsl = Get-WslExecutable
-    if (-not $wsl) { return $false }
-    $feature = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop
-    if ($feature.State -ne 'Enabled') { return $false }
-    return (Invoke-WslCommand $wsl @('--status')).Code -eq 0
-}
-
-function Install-WslPlatform {
-    if (Test-WslPlatform) {
-        Write-InstallMessage '[PASS] WSL2 platform is ready.'
-        return $true
-    }
+function Install-VmPackage {
+    param(
+        [string]$Id,
+        [string]$Name,
+        [scriptblock]$TestInstalled,
+        [string]$VersionPattern,
+        [string[]]$ExtraArguments = @()
+    )
     if (Test-RebootPending) {
         $script:RestartRequired = $true
         Write-InstallMessage '[MANUAL] A Windows restart is pending. Restart manually and rerun this script.'
         return $false
     }
-    if (-not (Confirm-InstallAction 'Enable the WSL2 virtual machine platform without restarting Windows.')) {
-        Write-InstallMessage '[MANUAL] Skipped the WSL2 platform setup.'
+    if (& $TestInstalled) { Write-InstallMessage "[PASS] $Name is installed. Keeping the existing installation."; return $true }
+    if (-not (Confirm-InstallAction "Install $Name ($Id). Review the license and installation details shown.")) {
+        Write-InstallMessage "[MANUAL] Skipped the $Name installation."
         return $false
     }
-    $feature = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop
-    if ($feature.State -ne 'Enabled') {
-        $result = Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All -NoRestart -ErrorAction Stop
-        if ($result.RestartNeeded) {
-            $script:RestartRequired = $true
-            Write-InstallMessage '[MANUAL] WSL2 needs a Windows restart. Restart manually and rerun this script.'
-            return $false
-        }
-    }
-    $wsl = Get-WslExecutable
-    if (-not $wsl) { throw 'wsl.exe was not found after enabling the WSL2 platform.' }
-    if (-not (Confirm-InstallAction 'Install WSL without a Linux distribution (wsl.exe --install --no-distribution).')) {
-        Write-InstallMessage '[MANUAL] Skipped the WSL2 platform installation.'
-        return $false
-    }
-    $result = Invoke-WslCommand $wsl @('--install', '--no-distribution')
-    $code = $result.Code
-    if ($code -in @(1641, 3010) -or (Test-RebootPending)) {
+    $arguments = @('install', '--id', $Id, '--exact', '--source', 'winget')
+    if ($Yes) { $arguments += @('--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity') }
+    if ($VersionPattern) { $arguments += @('--version', (Get-VmWingetVersion $Id $VersionPattern)) }
+    $arguments += $ExtraArguments
+    $null = Invoke-VmInstaller winget $arguments
+    if ($script:RestartRequired) { return $false }
+    if (Test-RebootPending) {
         $script:RestartRequired = $true
-        Write-InstallMessage '[MANUAL] WSL2 needs a Windows restart. Restart manually and rerun this script.'
+        Write-InstallMessage '[MANUAL] A Windows restart is pending. Restart manually and rerun this script.'
         return $false
     }
-    if ($code -ne 0) { throw "WSL2 platform installation failed (exit code $code): $($result.Text)" }
-    if (-not (Test-WslPlatform)) {
-        $script:RestartRequired = $true
-        Write-InstallMessage '[MANUAL] WSL2 becomes available after a Windows restart. Restart manually and rerun this script.'
-        return $false
-    }
-    Write-InstallMessage '[PASS] WSL2 platform is ready.'
+    if (Get-Command Update-ProcessPath -CommandType Function -ErrorAction SilentlyContinue) { Update-ProcessPath }
+    if (-not (& $TestInstalled)) { throw "Could not verify $Name after installation. Rerun from a new terminal." }
+    Write-InstallMessage "[PASS] Verified the $Name installation."
     return $true
 }
 
-function Get-UbuntuWslVersion {
-    $wsl = Get-WslExecutable
-    $result = Invoke-WslCommand $wsl @('--list', '--verbose')
-    $text = $result.Text
-    if ($result.Code -ne 0) {
-        if ($text -match 'Windows Subsystem for Linux has no installed distributions') { return 0 }
-        throw "Could not list WSL distributions: $text"
+function Test-VmWinget {
+    $command = Get-Command winget -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $command) { return $false }
+    $result = Invoke-LoggedProcess -Executable $command.Source -Arguments @('--version') `
+        -LogDirectory $logDirectory -StreamOutput -Quiet
+    if ($result.ExitCode -ne 0) {
+        Write-InstallMessage ('[WARN] WinGet is not ready (0x{0:X8}). See {1}.' -f $result.ExitCode, $logDirectory)
+        return $false
+    }
+    return $true
+}
+
+function Initialize-VmWinget {
+    if (Test-VmWinget) { return $true }
+    if (Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction Stop) {
+        if (-not (Confirm-InstallAction 'Register App Installer (Windows Package Manager) for the current user.')) { return $false }
+        Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
+    }
+    else {
+        if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
+            if (-not (Confirm-InstallAction 'Install the NuGet package provider required to prepare WinGet.')) { return $false }
+            $null = Install-PackageProvider -Name NuGet -Scope CurrentUser -Force -ErrorAction Stop
+        }
+        if (-not (Get-Module -ListAvailable Microsoft.WinGet.Client)) {
+            if (-not (Confirm-InstallAction 'Install the Microsoft.WinGet.Client module from PSGallery for the current user.')) { return $false }
+            Install-Module -Name Microsoft.WinGet.Client -Scope CurrentUser -Repository PSGallery -Force -ErrorAction Stop
+        }
+        if (-not (Confirm-InstallAction 'Install or repair the stable WinGet package manager for all users with Microsoft.WinGet.Client.')) { return $false }
+        Import-Module Microsoft.WinGet.Client -ErrorAction Stop
+        Repair-WinGetPackageManager -AllUsers -ErrorAction Stop | Out-Host
+    }
+    Update-ProcessPath
+    if (-not (Test-VmWinget)) {
+        throw 'winget is not working. Check App Installer and rerun from a new elevated terminal.'
+    }
+    return $true
+}
+
+function Test-VmPowerShell7 {
+    $path = Find-VmPowerShell
+    if (-not $path) { return $false }
+    $major = & $path -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.Major'
+    if ($LASTEXITCODE -ne 0 -or "$major".Trim() -ne '7') { throw 'Check the stable PowerShell 7.x path.' }
+    return $true
+}
+
+function Install-VmPowerShell {
+    return (Install-VmPackage Microsoft.PowerShell 'PowerShell 7.x' `
+        -VersionPattern '^7\.\d+\.\d+(?:\.\d+)?$' -TestInstalled { Test-VmPowerShell7 })
+}
+
+function Get-VmWslExecutable {
+    $command = Get-Command wsl.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+    $path = Join-Path $env:SystemRoot 'System32\wsl.exe'
+    if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
+}
+
+function Invoke-VmWindowsFeature {
+    param(
+        [ValidateSet('VirtualMachinePlatform', 'MSMQ-Server')]
+        [string]$FeatureName,
+        [switch]$Enable
+    )
+    # DISM cmdlets can fail with "Class not registered" in MSIX PowerShell 7.
+    $command = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+try {
+    if (__ENABLE__) {
+        $result = Enable-WindowsOptionalFeature -Online -FeatureName '__FEATURE__' -All -NoRestart -ErrorAction Stop
+        [pscustomobject]@{ RestartNeeded = [bool]$result.RestartNeeded } | ConvertTo-Json -Compress
+    }
+    else {
+        $result = Get-WindowsOptionalFeature -Online -FeatureName '__FEATURE__' -ErrorAction Stop
+        [pscustomobject]@{ State = [string]$result.State } | ConvertTo-Json -Compress
+    }
+}
+catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+'@
+    $enabled = if ($Enable) { '$true' } else { '$false' }
+    $command = $command.Replace('__ENABLE__', $enabled).Replace('__FEATURE__', $FeatureName)
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+    $engine = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $probe = Invoke-ToolProbe $engine @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)
+    if ($probe.Code -ne 0) {
+        throw "Windows PowerShell feature operation failed for $FeatureName (exit code $($probe.Code)): $($probe.Text)"
+    }
+    $result = $probe.Text | ConvertFrom-Json -ErrorAction Stop
+    if (($Enable -and $result.RestartNeeded -isnot [bool]) -or
+        (-not $Enable -and [string]::IsNullOrWhiteSpace($result.State))) {
+        throw "Invalid Windows PowerShell feature response for ${FeatureName}: $($probe.Text)"
+    }
+    return $result
+}
+
+function Test-VmWslPlatform {
+    $wsl = Get-VmWslExecutable
+    if (-not $wsl) { return $false }
+    $feature = Invoke-VmWindowsFeature -FeatureName VirtualMachinePlatform
+    if ("$($feature.State)" -ne 'Enabled') { return $false }
+    return (Invoke-ToolProbe $wsl @('--status')).Code -eq 0
+}
+
+function Install-VmWslPlatform {
+    if (Test-VmWslPlatform) { Write-InstallMessage '[PASS] WSL2 platform is ready.'; return $true }
+    $feature = Invoke-VmWindowsFeature -FeatureName VirtualMachinePlatform
+    if ("$($feature.State)" -in @('EnablePending', 'DisablePending')) { $script:RestartRequired = $true; return $false }
+    $wsl = Get-VmWslExecutable
+    if (-not $wsl) { throw 'wsl.exe was not found. Check the Windows 11 image and the WSL documentation.' }
+    if (-not (Confirm-InstallAction 'Install the WSL2 platform without a Linux distribution (wsl.exe --install --no-distribution). A manual restart is required. Ubuntu is installed in a later step after the restart.')) {
+        return $false
+    }
+    $null = Invoke-VmInstaller $wsl @('--install', '--no-distribution')
+    if ($script:RestartRequired) { return $false }
+    if (Test-VmWslPlatform) { Write-InstallMessage '[PASS] WSL2 platform is ready.'; return $true }
+    # wsl.exe can return 0 while VirtualMachinePlatform waits for a restart.
+    $script:RestartRequired = $true
+    Write-InstallMessage '[MANUAL] The WSL2 platform becomes available after a restart. Restart manually and rerun.'
+    return $false
+}
+
+function Get-VmUbuntuVersion {
+    $list = Invoke-ToolProbe wsl.exe @('--list', '--verbose')
+    $text = $list.Text -replace "`0", ''
+    if ($list.Code -ne 0) {
+        # WSL reports an empty distribution list as a nonzero exit code.
+        if ($text -match '^\s*Windows Subsystem for Linux has no installed distributions\.(?:\s|$)') { return 0 }
+        throw "Failed to list WSL distributions: $text"
     }
     if ($text -match '(?mi)^\s*\*?\s*Ubuntu(?:-[\w.]+)?\s+\S+\s+([12])\s*$') {
         return [int]$Matches[1]
@@ -805,36 +626,410 @@ function Get-UbuntuWslVersion {
     return 0
 }
 
-function Install-UbuntuWsl {
-    if (-not (Test-WslPlatform)) {
-        Write-InstallMessage '[MANUAL] Ubuntu requires the WSL2 platform. Complete that step and restart first.'
+function Install-VmUbuntu {
+    if (-not (Test-VmWslPlatform)) {
+        Write-InstallMessage '[MANUAL] Ubuntu requires the WSL2 platform. Complete the WSL2 platform step and restart first.'
         return $false
     }
-    $version = Get-UbuntuWslVersion
+    $version = Get-VmUbuntuVersion
     if ($version -eq 1) { throw 'The existing Ubuntu uses WSL1. Preserve its data and convert it to WSL2 manually.' }
-    if ($version -eq 2) {
-        Write-InstallMessage '[PASS] Ubuntu is installed on WSL2.'
-        return $true
-    }
-    if (-not (Confirm-InstallAction 'Install Ubuntu on WSL2 for the current user. Create the first Linux user manually after installation.')) {
-        Write-InstallMessage '[MANUAL] Skipped the Ubuntu installation.'
+    if ($version -eq 2) { Write-InstallMessage '[PASS] Verified Ubuntu on WSL2 for the current user.'; return $true }
+    if (-not (Confirm-InstallAction 'Install Ubuntu on WSL2 for the current user. Set up the first Linux user manually afterward.')) {
         return $false
     }
-    $wsl = Get-WslExecutable
-    $result = Invoke-WslCommand $wsl @('--install', '--distribution', 'Ubuntu', '--no-launch')
-    $code = $result.Code
-    if ($code -in @(1641, 3010) -or (Test-RebootPending)) {
-        $script:RestartRequired = $true
-        Write-InstallMessage '[MANUAL] Ubuntu requires a Windows restart. Restart manually and rerun this script.'
-        return $false
-    }
-    if ($code -ne 0) { throw "Ubuntu installation failed (exit code $code): $($result.Text)" }
-    if ((Get-UbuntuWslVersion) -ne 2) {
-        throw 'Ubuntu was not verified as a WSL2 distribution. Check WSL status and rerun.'
-    }
-    Write-InstallMessage '[PASS] Ubuntu is installed on WSL2.'
+    $null = Invoke-VmInstaller wsl.exe @('--install', '--distribution', 'Ubuntu', '--no-launch')
+    if ($script:RestartRequired) { return $false }
+    if ((Get-VmUbuntuVersion) -ne 2) { throw 'Could not verify Ubuntu on WSL2. Check for a pending restart and the WSL status.' }
     Write-InstallMessage '[MANUAL] Run wsl -d Ubuntu to set up the first Linux user.'
     return $true
+}
+
+function Install-VmDotnetSdk {
+    param([ValidateSet(10, 11)][int]$Major)
+    return (Install-VmPackage -Id "Microsoft.DotNet.SDK.$Major" -Name ".NET $Major SDK" `
+        -VersionPattern "^$Major\.\d+\.\d+$" -TestInstalled {
+            $probe = Invoke-ToolProbe dotnet @('--list-sdks')
+            $probe.Code -eq 0 -and $probe.Text -match "(?m)^$Major\.\d+\.\d+\s+\["
+        })
+}
+
+function Test-VmCommand {
+    param([string]$Name, [string[]]$Arguments = @('--version'))
+    $probe = Invoke-ToolProbe $Name $Arguments
+    return $probe.Code -eq 0 -and -not [string]::IsNullOrWhiteSpace($probe.Text)
+}
+
+function Test-VmDesktopApp {
+    param([string[]]$Paths)
+    return @($Paths | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }).Count -gt 0
+}
+
+function Install-VmDocker {
+    if (-not (Test-VmWslPlatform)) {
+        Write-InstallMessage '[MANUAL] Docker Desktop is waiting for a ready WSL2 platform.'
+        return $false
+    }
+    return (Install-VmPackage Docker.DockerDesktop 'Docker Desktop (WSL2 backend)' -TestInstalled {
+        Test-VmDesktopApp @((Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'))
+    } -ExtraArguments @('--override', 'install --backend=wsl-2'))
+}
+
+function Install-VmGit {
+    return (Install-VmPackage Git.Git Git -TestInstalled { Test-VmCommand git })
+}
+
+function Install-VmGitHubCli {
+    return (Install-VmPackage GitHub.cli 'GitHub CLI 2.45.0+' -TestInstalled {
+        $probe = Invoke-ToolProbe gh @('--version')
+        $probe.Code -eq 0 -and (Test-MinimumVersion $probe.Text '2.45.0')
+    })
+}
+
+function Install-VmCopilotCli {
+    return (Install-VmPackage GitHub.Copilot 'GitHub Copilot CLI' -TestInstalled {
+        Test-CopilotCli -LogDirectory $logDirectory
+    })
+}
+
+function Install-VmAzureCli {
+    return (Install-VmPackage Microsoft.AzureCLI 'Azure CLI' -TestInstalled { Test-VmCommand az })
+}
+
+function Install-VmAzd {
+    return (Install-VmPackage Microsoft.Azd azd -TestInstalled { Test-VmCommand azd @('version') })
+}
+
+function Install-VmVsCode {
+    return (Install-VmPackage Microsoft.VisualStudioCode 'VS Code' -TestInstalled {
+        Test-VmDesktopApp @((Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Code\Code.exe'),
+            (Join-Path $env:ProgramFiles 'Microsoft VS Code\Code.exe'))
+    })
+}
+
+function Get-WorkshopReleaseVersion {
+    param($Probe)
+    if ($Probe.Code -eq 0 -and $Probe.Text.Trim() -match '^v?(\d+\.\d+\.\d+)$') {
+        return [version]$Matches[1]
+    }
+}
+
+function Get-WorkshopNvmConfiguration {
+    $probe = Invoke-ToolProbe nvm @('config', 'get', 'root', 'mode', 'auto_install', 'enabled', '--json')
+    if ($probe.Code -ne 0) { Write-InstallMessage '[FAIL] Could not query nvm-windows 2 configuration.'; return }
+    try { $config = $probe.Text | ConvertFrom-Json -ErrorAction Stop }
+    catch [ArgumentException] { Write-InstallMessage '[FAIL] Invalid nvm-windows 2 configuration JSON.'; return }
+    if (-not $config -or -not $config.PSObject.Properties['root'] -or
+        -not $config.PSObject.Properties['mode'] -or -not $config.PSObject.Properties['enabled'] -or
+        -not $config.PSObject.Properties['auto_install'] -or
+        $config.root -isnot [string] -or -not [IO.Path]::IsPathFullyQualified($config.root) -or
+        -not (Split-Path $config.root.TrimEnd('\') -Parent) -or
+        $config.mode -cnotin @('shim', 'link') -or $config.enabled -isnot [bool] -or
+        $config.auto_install -isnot [bool] -or -not $config.enabled -or $config.auto_install) {
+        Write-InstallMessage '[MANUAL] Check nvm-windows 2 root/mode/enabled settings. This script will not continue with auto_install=true, to prevent installation without individual consent.'
+        return
+    }
+    return $config
+}
+
+function Get-WorkshopNvmSelection {
+    $list = Invoke-ToolProbe nvm @('list', '--json')
+    # nvm 2.0.x prints text instead of JSON before the first Node installation.
+    if ($list.Code -eq 0 -and $list.Text.Trim() -ceq 'No versions installed.') {
+        Write-InstallMessage '[INFO] nvm has no installed Node.js versions.'
+        return [pscustomobject]@{ Version = $null; IsEmpty = $true }
+    }
+    if ($list.Code -ne 0 -or $list.Text.Trim() -notmatch '^\[[\s\S]*\]$') { Write-InstallMessage '[FAIL] Could not list installed nvm-windows 2 versions.'; return }
+    try { $versions = @($list.Text | ConvertFrom-Json -ErrorAction Stop) }
+    catch [ArgumentException] { Write-InstallMessage '[FAIL] Invalid nvm-windows 2 version list JSON.'; return }
+    foreach ($entry in $versions) {
+        if (-not $entry -or -not $entry.PSObject.Properties['version'] -or
+            -not $entry.PSObject.Properties['installed'] -or -not $entry.PSObject.Properties['default'] -or
+            -not (Get-WorkshopReleaseVersion ([pscustomobject]@{ Code=0; Text=[string]$entry.version })) -or
+            $entry.installed -isnot [bool] -or $entry.default -isnot [bool]) {
+            Write-InstallMessage '[FAIL] Invalid nvm-windows 2 version list format.'; return
+        }
+    }
+    $defaults = @($versions | Where-Object { $_.installed -eq $true -and $_.default -eq $true })
+    if ($defaults.Count -gt 1) { Write-InstallMessage '[FAIL] Multiple default nvm-windows 2 versions were found.'; return }
+    return [pscustomobject]@{ Version = if ($defaults.Count) {
+        Get-WorkshopReleaseVersion ([pscustomobject]@{ Code=0; Text=[string]$defaults[0].version })
+    } else { $null }; IsEmpty = $versions.Count -eq 0 }
+}
+
+function Test-WorkshopNvmOwnership {
+    param([string]$NodePath)
+    $nvm = Get-Command nvm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $nvm) { return $false }
+    $version = Get-WorkshopReleaseVersion (Invoke-ToolProbe nvm @('version'))
+    if (-not $version) { return $false }
+    if ($version.Major -eq 2) {
+        $config = Get-WorkshopNvmConfiguration
+        if (-not $config) { return $false }
+        $root = [IO.Path]::GetFullPath($config.root).TrimEnd('\')
+        $dataRoot = Split-Path $root -Parent
+        $runtime = Join-Path $dataRoot '.nodejs'
+        $link = Get-Item -LiteralPath $runtime -Force -ErrorAction SilentlyContinue
+        if ($link) {
+            if ($link.LinkType -notin @('Junction', 'SymbolicLink') -or @($link.Target).Count -ne 1) { return $false }
+            $target = [IO.Path]::GetFullPath(@($link.Target)[0]).TrimEnd('\')
+            if ($config.mode -eq 'shim') {
+                if ($target -ine (Join-Path $dataRoot '.shim')) { return $false }
+            }
+            elseif ((Split-Path $target -Parent) -ine $root -or (Split-Path $target -Leaf) -notmatch '^v\d+\.\d+\.\d+$') { return $false }
+        }
+        if ($NodePath -and (-not $link -or
+            [IO.Path]::GetFullPath($NodePath) -ine (Join-Path $runtime 'node.exe'))) { return $false }
+        return $true
+    }
+    if ($version.Major -ne 1 -or -not $env:NVM_HOME -or -not $env:NVM_SYMLINK) { return $false }
+    if ([IO.Path]::GetFullPath($nvm.Source) -ine [IO.Path]::GetFullPath((Join-Path $env:NVM_HOME 'nvm.exe'))) { return $false }
+    $settings = Join-Path $env:NVM_HOME 'settings.txt'
+    if (-not (Test-Path -LiteralPath $settings -PathType Leaf)) { return $false }
+    $lines = Get-Content -LiteralPath $settings
+    $root = @($lines | Where-Object { $_ -match '^root:\s*(.+)$' } | ForEach-Object { $_ -replace '^root:\s*', '' })
+    $path = @($lines | Where-Object { $_ -match '^path:\s*(.+)$' } | ForEach-Object { $_ -replace '^path:\s*', '' })
+    if ($root.Count -ne 1 -or $path.Count -ne 1 -or
+        $root[0].TrimEnd('\') -ine $env:NVM_HOME.TrimEnd('\') -or
+        $path[0].TrimEnd('\') -ine $env:NVM_SYMLINK.TrimEnd('\')) { return $false }
+    $link = Get-Item -LiteralPath $env:NVM_SYMLINK -Force -ErrorAction SilentlyContinue
+    if ($link) {
+        if ($link.LinkType -ne 'SymbolicLink') { return $false }
+        $targets = @($link.Target)
+        if ($targets.Count -ne 1) { return $false }
+        $target = [IO.Path]::GetFullPath($targets[0])
+        if ((Split-Path $target -Parent) -ine $env:NVM_HOME.TrimEnd('\') -or
+            (Split-Path $target -Leaf) -notmatch '^v\d+\.\d+\.\d+$') { return $false }
+    }
+    if ($NodePath) {
+        if (-not $link -or [IO.Path]::GetFullPath($NodePath) -ine
+            [IO.Path]::GetFullPath((Join-Path $env:NVM_SYMLINK 'node.exe'))) { return $false }
+        $active = Get-WorkshopReleaseVersion (Invoke-ToolProbe node @('--version'))
+        if (-not $active -or (Split-Path $target -Leaf) -ine "v$active") { return $false }
+    }
+    return $true
+}
+
+function Get-WorkshopNodeRelease {
+    param([int]$Major)
+    $releases = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -TimeoutSec 30 -ErrorAction Stop
+    return ($releases | Where-Object { $_.version -match "^v$Major\.\d+\.\d+$" } |
+        ForEach-Object { [version]$_.version.TrimStart('v') } | Sort-Object -Descending | Select-Object -First 1)
+}
+
+function Enable-VmNvmRuntimePath {
+    param($Config)
+    if (-not $Config) { return }
+    $runtime = Join-Path (Split-Path $Config.root.TrimEnd('\') -Parent) '.nodejs'
+    if (Test-Path -LiteralPath (Join-Path $runtime 'node.exe') -PathType Leaf) {
+        if (-not (Test-WorkshopNvmOwnership (Join-Path $runtime 'node.exe'))) {
+            throw 'The nvm runtime directory is not safely managed by nvm. Resolve the conflict before changing PATH.'
+        }
+        Set-RuntimePath -Directory $runtime -Executable 'node.exe' -Name 'node'
+    }
+}
+
+function Install-WorkshopNode {
+    param([switch]$Update, [switch]$LatestLts)
+    if (-not $Yes -and -not (Test-InstallInteractive)) { return $false }
+    Update-ProcessPath
+    $node = Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($node -and $node.CommandType -ne 'Application') {
+        throw 'The existing node command is not an nvm executable. Resolve the conflict manually.'
+    }
+    $nvm = Get-Command nvm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $nvm) {
+        # nvm's installer may offer to take over an existing Node installation.
+        # Do not even launch it when ownership or its default link is ambiguous.
+        $defaultLink = if ($env:ProgramFiles) { Join-Path $env:ProgramFiles 'nodejs' }
+        if ($node -or $env:NVM_HOME -or $env:NVM_SYMLINK -or
+            ($defaultLink -and (Test-Path -LiteralPath $defaultLink))) {
+            Write-InstallMessage '[MANUAL] Existing Node.js/NVM paths will be preserved. Identify the original installer and prepare the switch to nvm-windows manually.'
+            return $false
+        }
+        if (-not (Get-Command winget -CommandType Application -ErrorAction SilentlyContinue)) {
+            Write-InstallMessage '[MANUAL] winget must already be installed to install nvm-windows.'
+            return $false
+        }
+        if (-not (Confirm-InstallAction 'Install AuthorSoftware.NVMWindows through winget. Network access, administrator approval, and a review of the terms may be required.')) { return $false }
+        & winget install --id AuthorSoftware.NVMWindows --exact --source winget | Out-Host
+        if ($LASTEXITCODE -ne 0) { Write-InstallMessage '[FAIL] nvm-windows installation failed.'; return $false }
+        Update-ProcessPath
+    }
+    $nodePath = if ($node) { $node.Source } else { $null }
+    if (-not (Test-WorkshopNvmOwnership $nodePath)) {
+        Write-InstallMessage '[MANUAL] Could not establish ownership of the nvm-windows configuration or active Node.js installation. No paths will be deleted or overwritten.'
+        return $false
+    }
+    $nvmVersion = Get-WorkshopReleaseVersion (Invoke-ToolProbe nvm @('version'))
+    if (-not $nvmVersion -or $nvmVersion.Major -notin @(1, 2)) { Write-InstallMessage '[FAIL] Could not verify a supported nvm-windows version.'; return $false }
+    $root = $env:NVM_HOME
+    $hasActive = [bool]$node
+    if ($nvmVersion -and $nvmVersion.Major -eq 2) {
+        $config = Get-WorkshopNvmConfiguration
+        if (-not $config) { return $false }
+        $root = $config.root
+        $selection = Get-WorkshopNvmSelection
+        if (-not $selection) { return $false }
+        $hasActive = $null -ne $selection.Version
+        if ($hasActive -and -not $node) {
+            Enable-VmNvmRuntimePath $config
+            $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
+        if ($hasActive -and -not $node) { Write-InstallMessage '[MANUAL] The nvm-windows Node.js executable directory is not in PATH. Rerun in a new terminal.'; return $false }
+    }
+    if (-not $root) { Write-InstallMessage '[FAIL] Could not verify the nvm-windows installation root.'; return $false }
+    $currentProbe = if ($node) { Invoke-ToolProbe node @('--version') }
+    $current = if ($currentProbe) { Get-WorkshopReleaseVersion $currentProbe }
+    if ($node -and -not $current -and ($hasActive -or $currentProbe.Code -eq 0)) { Write-InstallMessage '[FAIL] Could not verify a stable Node.js version.'; return $false }
+    $hasActive = [bool]$current
+    if ($current -and -not $Update) {
+        Write-InstallMessage "[INFO] Keeping Node.js $current (no -Update)."
+        return $current.Major -ge 22
+    }
+    $major = if ($current -and $current.Major -ge 22) { $current.Major } else { 22 }
+    try {
+        if ($LatestLts) {
+            $latest = [version](Get-LatestNodeLts).Version
+            $major = $latest.Major
+        }
+        else { $latest = Get-WorkshopNodeRelease $major }
+    }
+    catch { Write-InstallMessage "[FAIL] Could not query Node.js releases: $($_.Exception.Message)"; return $false }
+    if (-not $latest -or $latest.Major -ne $major) { Write-InstallMessage '[FAIL] Could not verify a stable Node.js release.'; return $false }
+    if ($current -and $current -ge $latest) { Write-InstallMessage "[PASS] Keeping Node.js $current (no downgrade)."; return $true }
+    $installedNode = Join-Path $root "v$latest\node.exe"
+    $firstInstall = $nvmVersion.Major -eq 2 -and $selection.IsEmpty -and -not $current
+    if (-not (Test-Path -LiteralPath $installedNode -PathType Leaf)) {
+        $description = "Install Node.js $latest through nvm. Existing versions will be preserved."
+        if ($firstInstall) {
+            $description += ' nvm 2 automatically selects the first installed version as the default. This also authorizes that activation for subsequent terminals.'
+        }
+        if (-not (Confirm-InstallAction $description)) {
+            return ($current -and $current.Major -ge 22)
+        }
+        $install = Invoke-ToolProbe nvm @('install', "$latest")
+        if ($install.Code -ne 0) { Write-InstallMessage "[FAIL] nvm install failed: $($install.Text)"; return $false }
+    }
+    $probe = Invoke-ToolProbe $installedNode @('--version')
+    if ((Get-WorkshopReleaseVersion $probe) -ne $latest) { Write-InstallMessage '[FAIL] Installed Node.js version verification failed.'; return $false }
+    if ($firstInstall) {
+        Update-ProcessPath
+        Enable-VmNvmRuntimePath $config
+        $liveNode = Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($liveNode -and $liveNode.CommandType -ne 'Application') {
+            Write-InstallMessage '[MANUAL] The node command changed. Activation will not proceed.'
+            return $false
+        }
+        $liveConfig = Get-WorkshopNvmConfiguration
+        $liveSelection = Get-WorkshopNvmSelection
+        if ($liveConfig -and $liveSelection -and $liveConfig.root -ieq $root -and
+            $liveConfig.mode -ceq $config.mode -and $liveSelection.Version -eq $latest -and
+            $liveNode -and (Test-WorkshopNvmOwnership $liveNode.Source) -and
+            (Get-WorkshopReleaseVersion (Invoke-ToolProbe node @('--version'))) -eq $latest) {
+            Write-InstallMessage "[PASS] [Windows host] nvm installed and selected the first Node.js $latest."
+            return $true
+        }
+    }
+    if (-not (Confirm-InstallAction "Run nvm use $latest`: change the shared Windows Node.js selection (shim/link). This affects subsequent terminals, but not running Node.js processes. Administrator approval may be required.")) {
+        Write-InstallMessage "[INFO] Activation skipped. If needed, run nvm use $latest manually and verify the result."
+        return ($current -and $current.Major -ge 22)
+    }
+    # Recheck immediately before a link change; never take over a new collision.
+    $liveNode = Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($liveNode -and $liveNode.CommandType -ne 'Application') {
+        Write-InstallMessage '[MANUAL] The node command changed. Activation will not proceed.'
+        return $false
+    }
+    $liveNodePath = if ($liveNode) { $liveNode.Source } else { $null }
+    if (-not (Test-WorkshopNvmOwnership $liveNodePath)) {
+        Write-InstallMessage '[MANUAL] nvm-windows management settings changed. Activation will not proceed.'
+        return $false
+    }
+    if ($nvmVersion.Major -eq 2) {
+        $liveConfig = Get-WorkshopNvmConfiguration
+        $liveSelection = Get-WorkshopNvmSelection
+        if (-not $liveConfig -or -not $liveSelection -or $liveConfig.root -ine $root -or
+            $liveConfig.mode -cne $config.mode -or $liveSelection.Version -ne $selection.Version) {
+            Write-InstallMessage '[MANUAL] nvm-windows 2 configuration or default selection changed. Activation will not proceed.'
+            return $false
+        }
+    }
+    $liveVersion = if ($liveNode -and $hasActive) { Get-WorkshopReleaseVersion (Invoke-ToolProbe node @('--version')) }
+    if ($liveVersion -ne $current) {
+        Write-InstallMessage '[MANUAL] Detected a Node.js path conflict or active version change. Activation will not proceed.'
+        return $false
+    }
+    $useArguments = @('use', "$latest")
+    if ($nvmVersion -and $nvmVersion.Major -eq 2) { $useArguments += '--no-install' }
+    $use = Invoke-ToolProbe nvm $useArguments
+    Update-ProcessPath
+    if ($nvmVersion.Major -eq 2) { Enable-VmNvmRuntimePath $config }
+    $activeNode = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($use.Code -ne 0 -or -not $activeNode -or
+        -not (Test-WorkshopNvmOwnership $activeNode.Source) -or
+        (Get-WorkshopReleaseVersion (Invoke-ToolProbe node @('--version'))) -ne $latest) {
+        Write-InstallMessage '[FAIL] Could not verify nvm activation or the running Node.js version. Check PATH and nvm list in a new terminal.'
+        return $false
+    }
+    Write-InstallMessage "[PASS] [Windows host] nvm Node.js $latest"
+    return $true
+}
+
+function Install-VmNvm {
+    param([switch]$LatestLts)
+    $nvm = Get-Command nvm -CommandType Application -ErrorAction SilentlyContinue
+    if ($nvm) {
+        $version = Get-WorkshopReleaseVersion (Invoke-ToolProbe nvm @('version'))
+        if (-not $version -or $version.Major -ne 2) { throw 'The existing nvm is not replaced automatically. Prepare nvm-windows 2.x manually.' }
+    }
+    else {
+        $nodeLink = Join-Path $env:ProgramFiles 'nodejs'
+        if ((Get-Command node -CommandType Application -ErrorAction SilentlyContinue) -or
+            $env:NVM_HOME -or $env:NVM_SYMLINK -or (Test-Path -LiteralPath $nodeLink)) {
+            throw 'Preserving the existing Node.js or NVM paths. Migrate to nvm-windows 2.x manually.'
+        }
+        $installed = Install-VmPackage -Id AuthorSoftware.NVMWindows -Name 'nvm-windows 2.x' -VersionPattern '^2\.\d+\.\d+$' -TestInstalled {
+            $v = Get-WorkshopReleaseVersion (Invoke-ToolProbe nvm @('version'))
+            $v -and $v.Major -eq 2
+        }
+        if (-not $installed) { return $false }
+    }
+    $probe = Invoke-ToolProbe nvm @('config', 'get', 'auto_install', '--json')
+    if ($probe.Code -ne 0) { throw 'Could not read the nvm auto_install setting.' }
+    $config = $probe.Text | ConvertFrom-Json -ErrorAction Stop
+    if (-not $config -or -not $config.PSObject.Properties['auto_install'] -or
+        $config.auto_install -isnot [bool]) { throw 'The nvm auto_install setting is invalid.' }
+    if ($config.auto_install) {
+        if (-not (Confirm-InstallAction 'Set nvm auto_install to false to prevent Node.js installations without consent.')) { return $false }
+        $change = Invoke-ToolProbe nvm @('config', 'set', 'auto_install=false')
+        if ($change.Code -ne 0) { throw "Failed to disable nvm auto_install: $($change.Text)" }
+    }
+    if (-not (Get-WorkshopNvmConfiguration)) {
+        throw 'Set auto_install to false in the nvm config, check root, mode and enabled, and rerun.'
+    }
+    $installed = if ($LatestLts) { Install-WorkshopNode -Update -LatestLts } else { Install-WorkshopNode }
+    if (-not $installed) { return $false }
+    Test-VmNodeCommands
+    return $true
+}
+
+function Test-VmNodeCommands {
+    $node = Get-Command node -ErrorAction Stop | Select-Object -First 1
+    if ($node.CommandType -ne 'Application' -or -not (Test-WorkshopNvmOwnership $node.Source)) {
+        throw 'node does not resolve to the nvm-managed runtime. Check PowerShell aliases, functions, and PATH.'
+    }
+    $npm = Get-Command npm -ErrorAction Stop | Select-Object -First 1
+    if ($npm.CommandType -notin @('Application', 'ExternalScript') -or
+        [IO.Path]::GetFullPath((Split-Path $npm.Source -Parent)) -ine
+            [IO.Path]::GetFullPath((Split-Path $node.Source -Parent)) -or
+        (Split-Path $npm.Source -Leaf) -notin @('npm.exe', 'npm.cmd', 'npm.ps1')) {
+        throw 'npm does not resolve to the nvm runtime directory. Check PowerShell aliases, functions, and PATH.'
+    }
+    $global:LASTEXITCODE = $null
+    $npmVersion = (& $npm.Source --version | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $npmVersion -notmatch '^\d+\.\d+\.\d+') {
+        throw 'The default npm command could not be verified.'
+    }
 }
 
 function Get-CopilotAppVersion {
@@ -915,39 +1110,6 @@ function Install-CopilotApp {
     }
 }
 
-function Test-DevToolCommands {
-    param([string]$LogDirectory)
-
-    Update-ProcessPath
-    $powerShell = Find-VmPowerShell
-    if (-not $powerShell) { throw 'PowerShell 7.x could not be located.' }
-    $checks = @(
-        @{ Command = $powerShell; Arguments = @('--version') }
-        @{ Command = 'dotnet.exe'; Arguments = @('--list-sdks') }
-        @{ Command = 'git.exe'; Arguments = @('--version') }
-        @{ Command = 'nvm.exe'; Arguments = @('version') }
-        @{ Command = 'uv.exe'; Arguments = @('--version') }
-        @{ Command = 'az.cmd'; Arguments = @('version', '--output', 'json') }
-        @{ Command = 'azd.exe'; Arguments = @('version') }
-        @{ Command = 'gh.exe'; Arguments = @('--version') }
-        @{ Command = 'copilot.exe'; Arguments = @('--version') }
-        @{ Command = 'code.cmd'; Arguments = @('--version') }
-    )
-    foreach ($check in $checks) {
-        Invoke-ToolCommand -CommandName $check.Command -Arguments $check.Arguments `
-            -LogDirectory $LogDirectory | Out-Null
-    }
-    $dotnetSdks = Invoke-ToolCommand -CommandName 'dotnet.exe' -Arguments @('--list-sdks') -LogDirectory $LogDirectory
-    foreach ($major in @(10, 11)) {
-        if ($dotnetSdks -notmatch "(?m)^$major\.\d+\.\d+\s+\[") {
-            throw ".NET $major SDK is missing. Install it separately, then rerun this script."
-        }
-    }
-    if (-not (Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe') -PathType Leaf)) {
-        throw 'Docker Desktop was not found after package installation.'
-    }
-}
-
 function Get-LatestNodeLts {
     $releases = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' `
         -TimeoutSec 60 -ErrorAction Stop
@@ -972,44 +1134,6 @@ function Get-LatestNodeLts {
     }
 }
 
-function Get-NvmRuntimeDirectory {
-    param([version]$NvmVersion, [string]$LogDirectory)
-
-    if ($NvmVersion.Major -lt 2) {
-        if ([string]::IsNullOrWhiteSpace($env:NVM_SYMLINK)) {
-            throw 'NVM_SYMLINK is not set. Check the nvm-windows installation.'
-        }
-        return $env:NVM_SYMLINK
-    }
-    $json = Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments @(
-        'config', 'get', 'root', 'mode', '--json'
-    ) -LogDirectory $LogDirectory
-    $config = $json | ConvertFrom-Json -ErrorAction Stop
-    if ($null -eq $config -or -not $config.PSObject.Properties['root'] -or
-        $config.root -isnot [string] -or -not [IO.Path]::IsPathRooted($config.root)) {
-        throw 'Could not determine the nvm-windows runtime directory.'
-    }
-    $parent = Split-Path $config.root.TrimEnd('\', '/') -Parent
-    if (-not $parent) { throw 'Could not determine the nvm-windows runtime directory.' }
-    $candidates = @((Join-Path $parent '.nodejs'))
-    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-        $candidates += Join-Path $env:LOCALAPPDATA 'Author Software\nvm\.nodejs'
-    }
-    $existing = @($candidates | Select-Object -Unique | Where-Object {
-        Test-Path -LiteralPath (Join-Path $_ 'node.exe') -PathType Leaf
-    })
-    if ($existing.Count -eq 1) { return $existing[0] }
-    if ($existing.Count -gt 1) {
-        $pathEntries = @($env:Path -split ';' | ForEach-Object {
-            [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"')).TrimEnd('\', '/')
-        })
-        $active = @($existing | Where-Object { $pathEntries -icontains $_.TrimEnd('\', '/') })
-        if ($active.Count -eq 1) { return $active[0] }
-        throw 'Multiple nvm-windows runtime directories were found. Resolve the PATH ambiguity before continuing.'
-    }
-    throw 'The nvm-windows runtime directory does not contain node.exe. Resolve any existing Node.js or nvm path conflict manually.'
-}
-
 function Assert-RuntimeCommand {
     param([string]$Name, [string]$ExpectedPath)
 
@@ -1018,64 +1142,6 @@ function Assert-RuntimeCommand {
         [IO.Path]::GetFullPath($command.Source) -ine [IO.Path]::GetFullPath($ExpectedPath)) {
         throw "$Name does not resolve to $ExpectedPath. Check PowerShell aliases, functions, and PATH."
     }
-}
-
-function Install-NodeRuntime {
-    param([string]$LogDirectory)
-
-    $node = Get-LatestNodeLts
-    if (-not (Confirm-InstallAction "Install and activate Node.js LTS $($node.Version) through nvm-windows.")) {
-        Write-InstallMessage '[MANUAL] Skipped the Node.js installation.'
-        return $false
-    }
-    $nvmVersion = [version]((Get-NvmVersion -LogDirectory $LogDirectory).Split('-')[0])
-    Update-ProcessPath
-    $currentNode = Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($currentNode) {
-        if ($currentNode.CommandType -ne 'Application') {
-            throw 'The existing node command is not an nvm executable. Resolve the conflict manually.'
-        }
-        $existingRuntime = Get-NvmRuntimeDirectory -NvmVersion $nvmVersion -LogDirectory $LogDirectory
-        Assert-NoRuntimeCommandConflict -Name 'node' -ExpectedPath (Join-Path $existingRuntime 'node.exe')
-        $null = Test-RuntimePath -Directory $existingRuntime -Executable 'node.exe'
-    }
-    $nodeArguments = @($node.Version)
-    if ($nvmVersion.Major -lt 2) {
-        $nodeArguments += '64'
-    }
-    # NVM 2 uses the native x64 build; a trailing "64" would request another Node version.
-    Write-InstallMessage "[INFO] Installing and activating Node.js LTS $($node.Version) ($($node.Lts))."
-    Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments (@('install') + $nodeArguments) `
-        -LogDirectory $LogDirectory | Out-Null
-    Update-ProcessPath
-    $runtimeDirectory = Get-NvmRuntimeDirectory -NvmVersion $nvmVersion -LogDirectory $LogDirectory
-    Assert-NoRuntimeCommandConflict -Name 'node' -ExpectedPath (Join-Path $runtimeDirectory 'node.exe')
-    $null = Test-RuntimePath -Directory $runtimeDirectory -Executable 'node.exe'
-    Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments (@('use') + $nodeArguments) `
-        -LogDirectory $LogDirectory | Out-Null
-    Update-ProcessPath
-    $runtimeDirectory = Get-NvmRuntimeDirectory -NvmVersion $nvmVersion -LogDirectory $LogDirectory
-    Set-RuntimePath -Directory $runtimeDirectory -Executable 'node.exe' -Name 'node'
-    Assert-RuntimeCommand -Name 'node' -ExpectedPath (Join-Path $runtimeDirectory 'node.exe')
-    $nodeJson = Invoke-ToolCommand -CommandName 'node.exe' -Arguments @(
-        '-p', 'JSON.stringify({version:process.versions.node,lts:process.release.lts,arch:process.arch})'
-    ) -LogDirectory $LogDirectory
-    if ([string]::IsNullOrWhiteSpace($nodeJson)) {
-        throw "Node.js did not return runtime information. See $LogDirectory."
-    }
-    $activeNode = $nodeJson | ConvertFrom-Json -ErrorAction Stop
-    if ($null -eq $activeNode -or
-        -not $activeNode.PSObject.Properties['version'] -or
-        -not $activeNode.PSObject.Properties['lts'] -or
-        -not $activeNode.PSObject.Properties['arch'] -or
-        $activeNode.version -ne $node.Version -or
-        $activeNode.lts -ne $node.Lts -or
-        $activeNode.arch -ne 'x64') {
-        throw "Active Node.js does not match LTS $($node.Version) for x64. Check NVM and PATH conflicts."
-    }
-    Invoke-ToolCommand -CommandName 'npm' -Arguments @('--version') `
-        -LogDirectory $LogDirectory | Out-Null
-    return $true
 }
 
 function Install-PythonRuntime {
@@ -1142,25 +1208,10 @@ function Install-PythonRuntime {
 function Test-RuntimeCommands {
     param([string]$LogDirectory)
 
-    $nvmVersion = [version]((Get-NvmVersion -LogDirectory $LogDirectory).Split('-')[0])
-    $nodeDirectory = Get-NvmRuntimeDirectory -NvmVersion $nvmVersion -LogDirectory $LogDirectory
     $pythonDirectory = Invoke-ToolCommand -CommandName 'uv.exe' -Arguments @(
         'python', 'dir', '--bin', '--no-config'
     ) -LogDirectory $LogDirectory
-    Assert-RuntimeCommand -Name 'node' -ExpectedPath (Join-Path $nodeDirectory 'node.exe')
     Assert-RuntimeCommand -Name 'python' -ExpectedPath (Join-Path $pythonDirectory 'python.exe')
-
-    $npm = Get-Command npm -ErrorAction Stop | Select-Object -First 1
-    if ($npm.CommandType -notin @('Application', 'ExternalScript') -or
-        [IO.Path]::GetFullPath((Split-Path $npm.Source -Parent)) -ine [IO.Path]::GetFullPath($nodeDirectory) -or
-        (Split-Path $npm.Source -Leaf) -notin @('npm.exe', 'npm.cmd', 'npm.ps1')) {
-        throw 'npm does not resolve to the nvm runtime directory. Check PowerShell aliases, functions, and PATH.'
-    }
-    $global:LASTEXITCODE = $null
-    $npmVersion = (& $npm.Source --version | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $npmVersion -notmatch '^\d+\.\d+\.\d+') {
-        throw 'The default npm command could not be verified.'
-    }
 }
 
 # Installer context and stages.
@@ -1187,77 +1238,67 @@ function Assert-VmInstallerContext {
     }
 }
 
-function Invoke-VmToolInstallation {
-    param([string]$LogDirectory, [string]$PythonVersion, [string]$WinGetExecutable)
-
-    $script:RestartRequired = $false
-    $complete = $true
-    Update-ProcessPath
-    $steps = @(
-        @{ Group='[2/7] Windows features'; Run={ Install-WslPlatform } },
-        @{ Run={
-            if (Test-WslPlatform) { return (Install-UbuntuWsl) }
-            Write-InstallMessage '[MANUAL] Ubuntu requires the WSL2 platform. Complete that step and restart first.'
-            return $false
-        } },
-        @{ Group='[3/7] Runtimes and SDKs'; Run={
-            Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Runtimes
-        } },
-        @{ Run={
-            try {
-                if (-not (Install-NvmForWindows -LogDirectory $LogDirectory)) {
-                    Write-InstallMessage '[MANUAL] nvm-windows is not ready.'
-                    return $false
-                }
-                return (Install-NodeRuntime -LogDirectory $LogDirectory)
-            }
-            catch {
-                Write-InstallMessage "[FAIL] Node.js installation failed: $($_.Exception.Message)"
-                if ($_.ScriptStackTrace) { Write-InstallMessage "[INFO] $($_.ScriptStackTrace)" }
-                return $false
-            }
-        } },
-        @{ Run={ Install-PythonRuntime -PythonVersion $PythonVersion -LogDirectory $LogDirectory } },
-        @{ Group='[4/7] Containers'; Run={
-            Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Containers
-        } },
-        @{ Group='[5/7] GitHub tools'; Run={
-            Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group GitHub
-        } },
-        @{ Group='[6/7] Azure tools'; Run={
-            Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Azure
-        } },
-        @{ Group='[7/7] Editors and apps'; Run={
-            Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Editors
-        } },
-        @{ Run={ Install-CopilotApp } }
-    )
-    foreach ($step in $steps) {
+function Invoke-VmInstallationSteps {
+    param([array]$Steps)
+    $failed = $false
+    foreach ($step in $Steps) {
         if ($step.ContainsKey('Group')) { Write-InstallMessage "[INFO] === $($step.Group) ===" }
-        if (-not (& $step.Run)) {
-            $complete = $false
+        try {
+            if (-not (& $step.Run)) { $failed = $true; Write-InstallMessage "[MANUAL] $($step.Name) is not ready." }
+        }
+        catch {
+            $failed = $true
+            Write-InstallMessage "[FAIL] $($step.Name): $($_.Exception.Message)"
+            if ($_.ScriptStackTrace) { Write-InstallMessage "[INFO] $($_.ScriptStackTrace)" }
         }
         if ($script:RestartRequired -or (Test-RebootPending)) {
             Write-InstallMessage '[MANUAL] A restart is required. The script does not restart automatically. Restart and rerun the same command.'
             return 3010
         }
     }
+    if ($failed) { return 1 }
+    return 0
+}
+
+function Invoke-VmToolInstallation {
+    param([string]$LogDirectory, [string]$PythonVersion)
+
+    $script:RestartRequired = $false
+    Update-ProcessPath
+    $steps = @(
+        @{ Group='[2/7] Windows features'; Name='WSL2 platform'; Run={ Install-VmWslPlatform } },
+        @{ Name='Ubuntu WSL2'; Run={ Install-VmUbuntu } },
+        @{ Group='[3/7] Runtimes and SDKs'; Name='.NET 10 SDK'; Run={ Install-VmDotnetSdk 10 } },
+        @{ Name='.NET 11 SDK'; Run={ Install-VmDotnetSdk 11 } },
+        @{ Name='uv'; Run={ Install-VmPackage astral-sh.uv 'uv' -TestInstalled { Test-VmCommand uv } } },
+        @{ Name='nvm and Node.js'; Run={ Install-VmNvm -LatestLts } },
+        @{ Name='Python'; Run={ Install-PythonRuntime -PythonVersion $PythonVersion -LogDirectory $LogDirectory } },
+        @{ Group='[4/7] Containers'; Name='Docker Desktop'; Run={ Install-VmDocker } },
+        @{ Group='[5/7] GitHub tools'; Name='Git'; Run={ Install-VmGit } },
+        @{ Name='GitHub CLI'; Run={ Install-VmGitHubCli } },
+        @{ Name='GitHub Copilot CLI'; Run={ Install-VmCopilotCli } },
+        @{ Group='[6/7] Azure tools'; Name='Azure CLI'; Run={ Install-VmAzureCli } },
+        @{ Name='azd'; Run={ Install-VmAzd } },
+        @{ Group='[7/7] Editors and apps'; Name='VS Code'; Run={ Install-VmVsCode } },
+        @{ Name='GitHub Copilot app'; Run={ Install-CopilotApp } }
+    )
+    $result = Invoke-VmInstallationSteps -Steps $steps
+    if ($result -eq 3010) { return $result }
 
     try {
-        Test-DevToolCommands -LogDirectory $LogDirectory
-        if ($complete) { Test-RuntimeCommands -LogDirectory $LogDirectory }
+        if ($result -eq 0) { Test-RuntimeCommands -LogDirectory $LogDirectory }
     }
     catch {
         Write-InstallMessage "[FAIL] Tool verification is incomplete: $($_.Exception.Message)"
-        $complete = $false
+        $result = 1
     }
     Write-InstallMessage '[MANUAL] Run wsl -d Ubuntu to create the first Linux user, then start Docker Desktop and verify Linux containers.'
     Write-InstallMessage '[INFO] Azure/GitHub authentication, Copilot app sign-in, and user onboarding were not performed.'
-    if (-not $complete) {
+    if ($result -ne 0) {
         Write-InstallMessage '[FAIL] One or more tools were declined, failed, or could not be verified. Resolve the messages above and rerun this script.'
         return 1
     }
-    Write-InstallMessage '[PASS] Tool installations and available versions were verified. Open a new terminal.'
+    Write-InstallMessage '[PASS] Tool installations were verified. Open a new terminal.'
     return 0
 }
 
@@ -1285,8 +1326,8 @@ try {
         exit 3010
     }
     Write-InstallMessage '[INFO] === [1/7] Installation prerequisites ==='
-    $wingetExecutable = Initialize-WinGet -LogDirectory $logDirectory
-    if (-not (Initialize-AgentPowerShell -WinGetExecutable $wingetExecutable -LogDirectory $logDirectory)) {
+    if (-not (Initialize-VmWinget)) { Write-InstallMessage '[MANUAL] winget is not ready.'; exit 1 }
+    if (-not (Install-VmPowerShell)) {
         if ($script:RestartRequired) { exit 3010 }
         exit 1
     }
@@ -1295,7 +1336,7 @@ try {
             -BoundParameters @{ PythonVersion = $PythonVersion; Yes = [bool]$Yes })
     }
     if ($PSVersionTable.PSVersion.Major -ne 7) { throw 'Run this script in PowerShell 7.x.' }
-    exit (Invoke-VmToolInstallation -LogDirectory $logDirectory -PythonVersion $PythonVersion -WinGetExecutable $wingetExecutable)
+    exit (Invoke-VmToolInstallation -LogDirectory $logDirectory -PythonVersion $PythonVersion)
 }
 catch {
     Write-Error "[FAIL] $($_.Exception.Message)" -ErrorAction Continue

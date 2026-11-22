@@ -19,6 +19,7 @@ function Assert-Throws([scriptblock]$Action, [string]$Pattern, [string]$Message)
     catch { $caught = $_.Exception.Message }
     Assert-True ($null -ne $caught -and $caught -match $Pattern) "$Message ($caught)"
 }
+function Test-RebootPending { return $false }
 
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ("appmod-vm-test-" + [guid]::NewGuid().ToString('N'))
 $null = [IO.Directory]::CreateDirectory($fixture)
@@ -45,6 +46,7 @@ try {
         $logDirectory = $fixture
         function Test-InstallInteractive { return $true }
         function Read-Host { throw 'Yes must not prompt' }
+        function Test-RebootPending { return $false }
         function Update-ProcessPath { }
         function Get-Command {
             param($Name, $CommandType, $ErrorAction)
@@ -193,13 +195,17 @@ namespace Appmod {
     }
 
     & {
-        function winget {
-            $global:LASTEXITCODE=0
-            "Versions`n3.0.0`n2.0.0`n2.0.1`n2.1.0-preview.1"
+        $logDirectory = $fixture
+        $script:VersionCode = 0
+        function Get-Command { [pscustomobject]@{ Source='fixture-winget.exe' } }
+        function Invoke-LoggedProcess {
+            [pscustomobject]@{ ExitCode=$script:VersionCode
+                StandardOutput="Versions`n3.0.0`n2.0.0`n2.0.1`n2.1.0-preview.1"
+                CombinedOutput='fixture lookup failure' }
         }
         Assert-True ((Get-VmWingetVersion AuthorSoftware.NVMWindows '^2\.\d+\.\d+$') -eq '2.0.1') 'release selection excludes other majors and previews'
         Assert-Throws { Get-VmWingetVersion Fixture.Package '^18\.\d+\.\d+$' } 'No stable' 'missing required major fails'
-        function winget { $global:LASTEXITCODE=1; 'fixture lookup failure' }
+        $script:VersionCode=1
         Assert-Throws { Get-VmWingetVersion Fixture.Package '^2\.\d+\.\d+$' } 'Failed to query' 'version discovery failure never falls back'
     }
 
@@ -207,9 +213,14 @@ namespace Appmod {
         function Confirm-InstallAction { return $true }
         function Update-ProcessPath { }
         function Test-VmPowerShell7 { return $script:PowerShellInstalled }
-        function winget {
-            $global:LASTEXITCODE=0
-            return $script:PowerShellVersions
+        $logDirectory = $fixture
+        function Get-Command {
+            param($Name, $CommandType, $ErrorAction)
+            if ($Name -eq 'winget') { return [pscustomobject]@{ Source='fixture-winget.exe' } }
+            return Microsoft.PowerShell.Core\Get-Command -Name $Name -CommandType $CommandType -ErrorAction $ErrorAction
+        }
+        function Invoke-LoggedProcess {
+            return [pscustomobject]@{ ExitCode=0; StandardOutput=$script:PowerShellVersions }
         }
         function Invoke-VmInstaller {
             param($Command,$Arguments)
@@ -242,9 +253,15 @@ namespace Appmod {
             Assert-True ($Name -eq 'dotnet' -and ($Arguments -join ' ') -eq '--list-sdks') 'SDK verification lists installed SDKs instead of relying on the default SDK'
             [pscustomobject]@{Code=0;Text=$script:SdkText}
         }
-        function winget {
-            $global:LASTEXITCODE=0
-            "Version`n11.0.101`n11.0.100`n11.0.102-preview.1`n10.0.101`n10.0.100"
+        $logDirectory = $fixture
+        function Get-Command {
+            param($Name, $CommandType, $ErrorAction)
+            if ($Name -eq 'winget') { return [pscustomobject]@{ Source='fixture-winget.exe' } }
+            return Microsoft.PowerShell.Core\Get-Command -Name $Name -CommandType $CommandType -ErrorAction $ErrorAction
+        }
+        function Invoke-LoggedProcess {
+            return [pscustomobject]@{ ExitCode=0
+                StandardOutput="Version`n11.0.101`n11.0.100`n11.0.102-preview.1`n10.0.101`n10.0.100" }
         }
         function Invoke-VmInstaller {
             param($Command,$Arguments)
@@ -465,7 +482,7 @@ namespace Appmod {
 
     & {
         function Get-Command { [pscustomobject]@{Source='Invoke-FixtureNative'} }
-        function Invoke-LoggedProcess { [pscustomobject]@{ ExitCode = $script:NativeCode } }
+        function Invoke-LoggedProcess { [pscustomobject]@{ ExitCode = $script:NativeCode; CombinedOutput = 'fixture native failure' } }
         $logDirectory = $fixture
         foreach ($code in @(1641,3010)) {
             $script:NativeCode=$code; $script:RestartRequired=$false
@@ -494,7 +511,10 @@ namespace Appmod {
 
     & {
         $script:Registered=$false
+        $logDirectory = $fixture
         function Get-Command { if ($script:Registered) { [pscustomobject]@{Source='fixture-winget.exe'} } }
+        function Invoke-LoggedProcess { [pscustomobject]@{ExitCode=0} }
+        function Update-ProcessPath { }
         function Get-AppxPackage { [pscustomobject]@{Name='Microsoft.DesktopAppInstaller'} }
         function Confirm-InstallAction { return $false }
         function Add-AppxPackage { throw 'must not register before consent' }
@@ -687,6 +707,7 @@ function Enable-WindowsOptionalFeature {
         function Confirm-InstallAction { $script:Approved }
         function Get-WorkshopNvmConfiguration { if (-not $script:AutoInstall) { [pscustomobject]@{auto_install=$false} } }
         function Install-WorkshopNode { $script:NodeCalls++; return $true }
+        function Test-VmNodeCommands { }
         Assert-True (-not (Install-VmNvm)) 'automatic Node installation is not enabled by default'
         Assert-True ($script:NodeCalls -eq 0) 'no Node probes before nvm policy consent'
         $script:Approved=$true
@@ -707,6 +728,7 @@ function Enable-WindowsOptionalFeature {
             return [pscustomobject]@{Code=0;Text='{"auto_install":false}'}
         }
         function Get-WorkshopNvmConfiguration { return [pscustomobject]@{ auto_install=$false } }
+        function Test-VmNodeCommands { }
         function Install-WorkshopNode {
             Assert-True (Confirm-InstallAction 'fixture Node installation') 'Yes covers the Node installation prompt'
             Assert-True (Confirm-InstallAction 'fixture Node activation') 'Yes covers the Node activation prompt'
@@ -892,6 +914,7 @@ function Enable-WindowsOptionalFeature {
         function Test-RebootPending { return $false }
         function Get-PSDrive { [pscustomobject]@{Free=100GB} }
         function Install-VmWslPlatform { $script:InstallationOrder.Add('WSL2'); return $true }
+        function Test-VmWslPlatform { return $true }
         function Install-VmUbuntu { $script:InstallationOrder.Add('Ubuntu'); return $true }
         function Install-VmMsmq { $script:InstallationOrder.Add('MSMQ'); return $true }
         function Install-VmPackage {

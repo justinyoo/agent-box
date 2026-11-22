@@ -279,6 +279,102 @@ function Update-ProcessPath {
     }
 }
 
+function Get-PersistentRuntimePath {
+    param([ValidateSet('User', 'Machine')][string]$Scope)
+
+    $root = if ($Scope -eq 'User') { [Microsoft.Win32.Registry]::CurrentUser } else { [Microsoft.Win32.Registry]::LocalMachine }
+    $subkey = if ($Scope -eq 'User') { 'Environment' } else { 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment' }
+    $key = $root.OpenSubKey($subkey, $false)
+    if ($null -eq $key) { throw "Cannot open the $Scope environment registry key." }
+    try {
+        return [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    }
+    finally { $key.Dispose() }
+}
+
+function Set-PersistentRuntimePath {
+    param([ValidateSet('User')][string]$Scope, [string]$Value)
+
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    if ($null -eq $key) { throw "Cannot write the $Scope environment registry key." }
+    try {
+        $existing = $key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $kind = if ($null -eq $existing) { [Microsoft.Win32.RegistryValueKind]::ExpandString } else { $key.GetValueKind('Path') }
+        if ($kind -notin @([Microsoft.Win32.RegistryValueKind]::String, [Microsoft.Win32.RegistryValueKind]::ExpandString)) {
+            throw "The $Scope PATH has an unsupported registry type."
+        }
+        $key.SetValue('Path', $Value, $kind)
+    }
+    finally { $key.Dispose() }
+
+    if (-not ('AgentBox.EnvironmentNotifier' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace AgentBox {
+    public static class EnvironmentNotifier {
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr wParam,
+            string lParam, uint flags, uint timeout, out UIntPtr result);
+    }
+}
+'@ -ErrorAction Stop
+    }
+    $result = [UIntPtr]::Zero
+    $sent = [AgentBox.EnvironmentNotifier]::SendMessageTimeout(
+        [IntPtr]0xffff, 0x1a, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result
+    )
+    if ($sent -eq [IntPtr]::Zero) { throw "Updated $Scope PATH, but could not broadcast the environment change. Sign out and sign in again." }
+}
+
+function Assert-NoRuntimeCommandConflict {
+    param([string]$Name, [string]$ExpectedPath)
+
+    $command = Get-Command $Name -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command -and ($command.CommandType -ne 'Application' -or
+        [IO.Path]::GetFullPath($command.Source) -ine [IO.Path]::GetFullPath($ExpectedPath))) {
+        throw "The existing $Name command ($($command.Source)) takes precedence over $ExpectedPath. Resolve the conflict manually; PATH was not reordered."
+    }
+}
+
+function Test-RuntimePath {
+    param([string]$Directory, [string]$Executable)
+
+    $machinePath = Get-PersistentRuntimePath -Scope Machine
+    $userPath = Get-PersistentRuntimePath -Scope User
+    $target = [Environment]::ExpandEnvironmentVariables($Directory).TrimEnd('\', '/')
+    foreach ($entry in ((@($machinePath, $userPath) -join ';') -split ';')) {
+        $expanded = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"'))
+        if ($expanded.TrimEnd('\', '/') -ieq $target) { return $true }
+        if ($expanded -and [IO.Path]::IsPathRooted($expanded) -and
+            (Test-Path -LiteralPath (Join-Path $expanded $Executable) -PathType Leaf)) {
+            throw "An existing $Executable in $expanded takes precedence over $Directory. Resolve the PATH conflict manually; existing entries were preserved."
+        }
+    }
+    return $false
+}
+
+function Set-RuntimePath {
+    param([string]$Directory, [string]$Executable, [string]$Name)
+
+    if (-not [IO.Path]::IsPathRooted($Directory) -or $Directory -match '[;"]' -or
+        -not (Test-Path -LiteralPath (Join-Path $Directory $Executable) -PathType Leaf)) {
+        throw "The runtime executable directory is invalid: $Directory"
+    }
+    Update-ProcessPath
+    Assert-NoRuntimeCommandConflict -Name $Name -ExpectedPath (Join-Path $Directory $Executable)
+    $found = Test-RuntimePath -Directory $Directory -Executable $Executable
+    if (-not $found) {
+        if (-not (Confirm-InstallAction "Append $Directory to the user PATH for $Executable, preserving existing entries and their order.")) {
+            throw "Adding $Directory to the user PATH was declined."
+        }
+        $userPath = Get-PersistentRuntimePath -Scope User
+        $separator = if ($userPath -and -not $userPath.EndsWith(';')) { ';' } else { '' }
+        Set-PersistentRuntimePath -Scope User -Value "$userPath$separator$Directory"
+    }
+    Update-ProcessPath
+}
+
 function Invoke-FrameworkProbe {
     param([string]$File, [string[]]$Arguments)
     try {
@@ -428,11 +524,50 @@ function Get-WorkshopNodeRelease {
         ForEach-Object { [version]$_.version.TrimStart('v') } | Sort-Object -Descending | Select-Object -First 1)
 }
 
+function Get-LatestNodeLts {
+    $releases = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' `
+        -TimeoutSec 60 -ErrorAction Stop
+    $ltsReleases = @($releases | Where-Object { $_.lts -is [string] -and $_.lts.Length -gt 0 })
+    if ($ltsReleases.Count -eq 0) {
+        throw 'The Node.js release index contains no LTS releases.'
+    }
+    foreach ($release in $ltsReleases) {
+        if ($release.version -notmatch '^v\d+\.\d+\.\d+$') {
+            throw 'The Node.js release index contains an invalid LTS version.'
+        }
+    }
+    $latest = $ltsReleases |
+        Sort-Object { [version]$_.version.Substring(1) } -Descending |
+        Select-Object -First 1
+    if ($latest.files -notcontains 'win-x64-zip') {
+        throw "Node.js $($latest.version) has no Windows x64 ZIP in the release index."
+    }
+    return [pscustomobject]@{
+        Version = $latest.version.Substring(1)
+        Lts = $latest.lts
+    }
+}
+
+function Enable-VmNvmRuntimePath {
+    param($Config)
+    if (-not $Config) { return }
+    $runtime = Join-Path (Split-Path $Config.root.TrimEnd('\') -Parent) '.nodejs'
+    if (Test-Path -LiteralPath (Join-Path $runtime 'node.exe') -PathType Leaf) {
+        if (-not (Test-WorkshopNvmOwnership (Join-Path $runtime 'node.exe'))) {
+            throw 'The nvm runtime directory is not safely managed by nvm. Resolve the conflict before changing PATH.'
+        }
+        Set-RuntimePath -Directory $runtime -Executable 'node.exe' -Name 'node'
+    }
+}
+
 function Install-WorkshopNode {
-    param([switch]$Update)
+    param([switch]$Update, [switch]$LatestLts)
     if (-not $Yes -and -not (Test-InstallInteractive)) { return $false }
     Update-ProcessPath
-    $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $node = Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($node -and $node.CommandType -ne 'Application') {
+        throw 'The existing node command is not an nvm executable. Resolve the conflict manually.'
+    }
     $nvm = Get-Command nvm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $nvm) {
         # nvm's installer may offer to take over an existing Node installation.
@@ -468,6 +603,10 @@ function Install-WorkshopNode {
         $selection = Get-WorkshopNvmSelection
         if (-not $selection) { return $false }
         $hasActive = $null -ne $selection.Version
+        if ($hasActive -and -not $node) {
+            Enable-VmNvmRuntimePath $config
+            $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
         if ($hasActive -and -not $node) { Write-InstallMessage '[MANUAL] The nvm-windows Node.js executable directory is not in PATH. Rerun in a new terminal.'; return $false }
     }
     if (-not $root) { Write-InstallMessage '[FAIL] Could not verify the nvm-windows installation root.'; return $false }
@@ -480,7 +619,13 @@ function Install-WorkshopNode {
         return $current.Major -ge 22
     }
     $major = if ($current -and $current.Major -ge 22) { $current.Major } else { 22 }
-    try { $latest = Get-WorkshopNodeRelease $major }
+    try {
+        if ($LatestLts) {
+            $latest = [version](Get-LatestNodeLts).Version
+            $major = $latest.Major
+        }
+        else { $latest = Get-WorkshopNodeRelease $major }
+    }
     catch { Write-InstallMessage "[FAIL] Could not query Node.js releases: $($_.Exception.Message)"; return $false }
     if (-not $latest -or $latest.Major -ne $major) { Write-InstallMessage '[FAIL] Could not verify a stable Node.js release.'; return $false }
     if ($current -and $current -ge $latest) { Write-InstallMessage "[PASS] Keeping Node.js $current (no downgrade)."; return $true }
@@ -501,7 +646,12 @@ function Install-WorkshopNode {
     if ((Get-WorkshopReleaseVersion $probe) -ne $latest) { Write-InstallMessage '[FAIL] Installed Node.js version verification failed.'; return $false }
     if ($firstInstall) {
         Update-ProcessPath
-        $liveNode = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        Enable-VmNvmRuntimePath $config
+        $liveNode = Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($liveNode -and $liveNode.CommandType -ne 'Application') {
+            Write-InstallMessage '[MANUAL] The node command changed. Activation will not proceed.'
+            return $false
+        }
         $liveConfig = Get-WorkshopNvmConfiguration
         $liveSelection = Get-WorkshopNvmSelection
         if ($liveConfig -and $liveSelection -and $liveConfig.root -ieq $root -and
@@ -517,7 +667,11 @@ function Install-WorkshopNode {
         return ($current -and $current.Major -ge 22)
     }
     # Recheck immediately before a link change; never take over a new collision.
-    $liveNode = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $liveNode = Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($liveNode -and $liveNode.CommandType -ne 'Application') {
+        Write-InstallMessage '[MANUAL] The node command changed. Activation will not proceed.'
+        return $false
+    }
     $liveNodePath = if ($liveNode) { $liveNode.Source } else { $null }
     if (-not (Test-WorkshopNvmOwnership $liveNodePath)) {
         Write-InstallMessage '[MANUAL] nvm-windows management settings changed. Activation will not proceed.'
@@ -541,6 +695,7 @@ function Install-WorkshopNode {
     if ($nvmVersion -and $nvmVersion.Major -eq 2) { $useArguments += '--no-install' }
     $use = Invoke-ToolProbe nvm $useArguments
     Update-ProcessPath
+    if ($nvmVersion.Major -eq 2) { Enable-VmNvmRuntimePath $config }
     $activeNode = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($use.Code -ne 0 -or -not $activeNode -or
         -not (Test-WorkshopNvmOwnership $activeNode.Source) -or
@@ -558,12 +713,13 @@ function Invoke-VmInstaller {
     $result = Invoke-LoggedProcess -Executable $executable.Source -Arguments $Arguments `
         -LogDirectory $logDirectory -StreamOutput
     $code = $result.ExitCode
-    if ($code -in @(1641, 3010)) {
+    if ($code -in @([uint32]1641, [uint32]3010,
+            [Convert]::ToUInt32('8A150109', 16), [Convert]::ToUInt32('8A15010A', 16))) {
         $script:RestartRequired = $true
         Write-InstallMessage '[MANUAL] The installer requested a restart. Restart manually and rerun this script.'
         return $true
     }
-    if ($code -ne 0) { throw "$Command installation failed (exit code $code)." }
+    if ($code -ne 0) { throw "$Command installation failed (exit code $code): $($result.CombinedOutput)" }
     return $true
 }
 
@@ -606,6 +762,11 @@ function Install-VmPackage {
         [string]$VersionPattern,
         [string[]]$ExtraArguments = @()
     )
+    if (Test-RebootPending) {
+        $script:RestartRequired = $true
+        Write-InstallMessage '[MANUAL] A Windows restart is pending. Restart manually and rerun this script.'
+        return $false
+    }
     if (& $TestInstalled) { Write-InstallMessage "[PASS] $Name is installed. Keeping the existing installation."; return $true }
     if (-not (Confirm-InstallAction "Install $Name ($Id). Review the license and installation details shown.")) {
         Write-InstallMessage "[MANUAL] Skipped the $Name installation."
@@ -617,14 +778,31 @@ function Install-VmPackage {
     $arguments += $ExtraArguments
     $null = Invoke-VmInstaller winget $arguments
     if ($script:RestartRequired) { return $false }
+    if (Test-RebootPending) {
+        $script:RestartRequired = $true
+        Write-InstallMessage '[MANUAL] A Windows restart is pending. Restart manually and rerun this script.'
+        return $false
+    }
     if (Get-Command Update-ProcessPath -CommandType Function -ErrorAction SilentlyContinue) { Update-ProcessPath }
     if (-not (& $TestInstalled)) { throw "Could not verify $Name after installation. Rerun from a new terminal." }
     Write-InstallMessage "[PASS] Verified the $Name installation."
     return $true
 }
 
+function Test-VmWinget {
+    $command = Get-Command winget -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $command) { return $false }
+    $result = Invoke-LoggedProcess -Executable $command.Source -Arguments @('--version') `
+        -LogDirectory $logDirectory -StreamOutput -Quiet
+    if ($result.ExitCode -ne 0) {
+        Write-InstallMessage ('[WARN] WinGet is not ready (0x{0:X8}). See {1}.' -f $result.ExitCode, $logDirectory)
+        return $false
+    }
+    return $true
+}
+
 function Initialize-VmWinget {
-    if (Get-Command winget -CommandType Application -ErrorAction SilentlyContinue) { return $true }
+    if (Test-VmWinget) { return $true }
     if (Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction Stop) {
         if (-not (Confirm-InstallAction 'Register App Installer (Windows Package Manager) for the current user.')) { return $false }
         Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
@@ -642,8 +820,9 @@ function Initialize-VmWinget {
         Import-Module Microsoft.WinGet.Client -ErrorAction Stop
         Repair-WinGetPackageManager -AllUsers -ErrorAction Stop | Out-Host
     }
-    if (-not (Get-Command winget -CommandType Application -ErrorAction SilentlyContinue)) {
-        throw 'winget was not found. Rerun from a new elevated terminal.'
+    Update-ProcessPath
+    if (-not (Test-VmWinget)) {
+        throw 'winget is not working. Check App Installer and rerun from a new elevated terminal.'
     }
     return $true
 }
@@ -743,7 +922,7 @@ function Get-VmUbuntuVersion {
         if ($text -match '^\s*Windows Subsystem for Linux has no installed distributions\.(?:\s|$)') { return 0 }
         throw "Failed to list WSL distributions: $text"
     }
-    if ($text -match '(?m)^\s*\*?\s*Ubuntu\s+\S+\s+([12])\s*$') {
+    if ($text -match '(?mi)^\s*\*?\s*Ubuntu(?:-[\w.]+)?\s+\S+\s+([12])\s*$') {
         return [int]$Matches[1]
     }
     return 0
@@ -880,6 +1059,7 @@ function Install-VmPostgresClient {
 }
 
 function Install-VmNvm {
+    param([switch]$LatestLts)
     $nvm = Get-Command nvm -CommandType Application -ErrorAction SilentlyContinue
     if ($nvm) {
         $version = Get-WorkshopReleaseVersion (Invoke-ToolProbe nvm @('version'))
@@ -910,7 +1090,29 @@ function Install-VmNvm {
     if (-not (Get-WorkshopNvmConfiguration)) {
         throw 'Set auto_install to false in the nvm config, check root, mode and enabled, and rerun.'
     }
-    return Install-WorkshopNode
+    $installed = if ($LatestLts) { Install-WorkshopNode -Update -LatestLts } else { Install-WorkshopNode }
+    if (-not $installed) { return $false }
+    Test-VmNodeCommands
+    return $true
+}
+
+function Test-VmNodeCommands {
+    $node = Get-Command node -ErrorAction Stop | Select-Object -First 1
+    if ($node.CommandType -ne 'Application' -or -not (Test-WorkshopNvmOwnership $node.Source)) {
+        throw 'node does not resolve to the nvm-managed runtime. Check PowerShell aliases, functions, and PATH.'
+    }
+    $npm = Get-Command npm -ErrorAction Stop | Select-Object -First 1
+    if ($npm.CommandType -notin @('Application', 'ExternalScript') -or
+        [IO.Path]::GetFullPath((Split-Path $npm.Source -Parent)) -ine
+            [IO.Path]::GetFullPath((Split-Path $node.Source -Parent)) -or
+        (Split-Path $npm.Source -Leaf) -notin @('npm.exe', 'npm.cmd', 'npm.ps1')) {
+        throw 'npm does not resolve to the nvm runtime directory. Check PowerShell aliases, functions, and PATH.'
+    }
+    $global:LASTEXITCODE = $null
+    $npmVersion = (& $npm.Source --version | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $npmVersion -notmatch '^\d+\.\d+\.\d+') {
+        throw 'The default npm command could not be verified.'
+    }
 }
 
 function Get-VmVsInstance {
@@ -1037,6 +1239,48 @@ function Test-VmDesktopApp {
     return @($Paths | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }).Count -gt 0
 }
 
+function Install-VmDocker {
+    if (-not (Test-VmWslPlatform)) {
+        Write-InstallMessage '[MANUAL] Docker Desktop is waiting for a ready WSL2 platform.'
+        return $false
+    }
+    return (Install-VmPackage Docker.DockerDesktop 'Docker Desktop (WSL2 backend)' -TestInstalled {
+        Test-VmDesktopApp @((Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'))
+    } -ExtraArguments @('--override', 'install --backend=wsl-2'))
+}
+
+function Install-VmGit {
+    return (Install-VmPackage Git.Git Git -TestInstalled { Test-VmCommand git })
+}
+
+function Install-VmGitHubCli {
+    return (Install-VmPackage GitHub.cli 'GitHub CLI 2.45.0+' -TestInstalled {
+        $probe = Invoke-ToolProbe gh @('--version')
+        $probe.Code -eq 0 -and (Test-MinimumVersion $probe.Text '2.45.0')
+    })
+}
+
+function Install-VmCopilotCli {
+    return (Install-VmPackage GitHub.Copilot 'GitHub Copilot CLI' -TestInstalled {
+        Test-CopilotCli -LogDirectory $logDirectory
+    })
+}
+
+function Install-VmAzureCli {
+    return (Install-VmPackage Microsoft.AzureCLI 'Azure CLI' -TestInstalled { Test-VmCommand az })
+}
+
+function Install-VmAzd {
+    return (Install-VmPackage Microsoft.Azd azd -TestInstalled { Test-VmCommand azd @('version') })
+}
+
+function Install-VmVsCode {
+    return (Install-VmPackage Microsoft.VisualStudioCode 'VS Code' -TestInstalled {
+        Test-VmDesktopApp @((Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Code\Code.exe'),
+            (Join-Path $env:ProgramFiles 'Microsoft VS Code\Code.exe'))
+    })
+}
+
 function Install-VmMicrosoftMsi {
     param([string]$Name, [string]$Uri, [string]$Sha256, [scriptblock]$TestInstalled, [string]$Properties = '')
     if (& $TestInstalled) { Write-InstallMessage "[PASS] $Name is installed. Keeping the existing installation."; return $true }
@@ -1134,6 +1378,28 @@ function Assert-VmInstallerContext {
     }
 }
 
+function Invoke-VmInstallationSteps {
+    param([array]$Steps)
+    $failed = $false
+    foreach ($step in $Steps) {
+        if ($step.ContainsKey('Group')) { Write-InstallMessage "[INFO] === $($step.Group) ===" }
+        try {
+            if (-not (& $step.Run)) { $failed = $true; Write-InstallMessage "[MANUAL] $($step.Name) is not ready." }
+        }
+        catch {
+            $failed = $true
+            Write-InstallMessage "[FAIL] $($step.Name): $($_.Exception.Message)"
+            if ($_.ScriptStackTrace) { Write-InstallMessage "[INFO] $($_.ScriptStackTrace)" }
+        }
+        if ($script:RestartRequired -or (Test-RebootPending)) {
+            Write-InstallMessage '[MANUAL] A restart is required. The script does not restart automatically. Restart and rerun the same command.'
+            return 3010
+        }
+    }
+    if ($failed) { return 1 }
+    return 0
+}
+
 function Invoke-VmToolInstallation {
     $script:RestartRequired = $false
     if (Test-RebootPending) {
@@ -1161,53 +1427,23 @@ function Invoke-VmToolInstallation {
         @{ Name='SQL Server LocalDB'; Run={ Install-VmLocalDb } },
         @{ Name='Framework build and run tools'; Run={ Test-VmFrameworkTools } },
         @{ Group='[5/8] Database and containers'; Name='PostgreSQL 18 client'; Run={ Install-VmPostgresClient } },
-        @{ Name='Docker Desktop'; Run={
-            Install-VmPackage Docker.DockerDesktop 'Docker Desktop (WSL2 backend)' -TestInstalled {
-                Test-VmDesktopApp @((Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'))
-            } -ExtraArguments @('--override', 'install --backend=wsl-2')
-        } },
-        @{ Group='[6/8] GitHub tools'; Name='Git'; Run={ Install-VmPackage Git.Git Git -TestInstalled { Test-VmCommand git } } },
-        @{ Name='GitHub CLI'; Run={
-            Install-VmPackage GitHub.cli 'GitHub CLI 2.45.0+' -TestInstalled {
-                $probe = Invoke-ToolProbe gh @('--version')
-                $probe.Code -eq 0 -and (Test-MinimumVersion $probe.Text '2.45.0')
-            }
-        } },
-        @{ Name='GitHub Copilot CLI'; Run={
-            Install-VmPackage GitHub.Copilot 'GitHub Copilot CLI' -TestInstalled { Test-CopilotCli -LogDirectory $logDirectory }
-        } },
-        @{ Group='[7/8] Azure tools'; Name='Azure CLI'; Run={ Install-VmPackage Microsoft.AzureCLI 'Azure CLI' -TestInstalled { Test-VmCommand az } } },
-        @{ Name='azd'; Run={ Install-VmPackage Microsoft.Azd azd -TestInstalled { Test-VmCommand azd @('version') } } },
-        @{ Group='[8/8] Editors and modernization tools'; Name='VS Code'; Run={
-            Install-VmPackage Microsoft.VisualStudioCode 'VS Code' -TestInstalled {
-                Test-VmDesktopApp @((Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Code\Code.exe'),
-                    (Join-Path $env:ProgramFiles 'Microsoft VS Code\Code.exe'))
-            }
-        } },
+        @{ Name='Docker Desktop'; Run={ Install-VmDocker } },
+        @{ Group='[6/8] GitHub tools'; Name='Git'; Run={ Install-VmGit } },
+        @{ Name='GitHub CLI'; Run={ Install-VmGitHubCli } },
+        @{ Name='GitHub Copilot CLI'; Run={ Install-VmCopilotCli } },
+        @{ Group='[7/8] Azure tools'; Name='Azure CLI'; Run={ Install-VmAzureCli } },
+        @{ Name='azd'; Run={ Install-VmAzd } },
+        @{ Group='[8/8] Editors and modernization tools'; Name='VS Code'; Run={ Install-VmVsCode } },
         @{ Name='GitHub Copilot app'; Run={ Install-CopilotApp } },
         @{ Name='Modernize CLI'; Run={
             Install-VmPackage GitHub.Copilot.modernization.agent 'Modernize CLI' -TestInstalled { Test-VmCommand modernize }
         } }
     )
-    $failed = $false
-    foreach ($step in $steps) {
-        if ($step.ContainsKey('Group')) { Write-InstallMessage "[INFO] === $($step.Group) ===" }
-        try {
-            if (-not (& $step.Run)) { $failed = $true; Write-InstallMessage "[MANUAL] $($step.Name) is not ready." }
-        }
-        catch {
-            $failed = $true
-            Write-InstallMessage "[FAIL] $($step.Name): $($_.Exception.Message)"
-            if ($_.ScriptStackTrace) { Write-InstallMessage "[INFO] $($_.ScriptStackTrace)" }
-        }
-        if ($script:RestartRequired -or (Test-RebootPending)) {
-            Write-InstallMessage '[MANUAL] A restart is required. The script does not restart automatically. Restart and rerun the same command.'
-            return 3010
-        }
-    }
+    $result = Invoke-VmInstallationSteps -Steps $steps
+    if ($result -eq 3010) { return $result }
     Write-InstallMessage '[MANUAL] Set up the first Ubuntu user, start Docker Desktop and confirm Linux containers, sign in to the Copilot app, authenticate gh and Copilot CLI, and verify Modernize CLI.'
     Write-InstallMessage '[INFO] Azure/GitHub sign-in, subscription changes, provider registration and lab database creation were not performed.'
-    if ($failed) { return 1 }
+    if ($result -ne 0) { return 1 }
     Write-InstallMessage '[PASS] Verified the tool installations. Validate app builds and the VM runtime separately.'
     return 0
 }
