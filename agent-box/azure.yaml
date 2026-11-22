@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://aka.ms/azure.yaml.json
+name: agent-box
+
+requiredVersions:
+  azd: ">= 1.35.1"
+
+infra:
+  provider: bicep
+  path: infra
+  module: main
+
+hooks:
+  preprovision:
+    posix:
+      shell: sh
+      interactive: true
+      run: bash ./infra/scripts/preprovision.sh
+    windows:
+      shell: pwsh
+      interactive: true
+      run: ./infra/scripts/preprovision.ps1
+  postprovision:
+    posix:
+      shell: sh
+      interactive: false
+      run: bash ./infra/scripts/postprovision.sh
+    windows:
+      shell: pwsh
+      interactive: false
+      run: ./infra/scripts/postprovision.ps1

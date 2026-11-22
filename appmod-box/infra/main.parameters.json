@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environmentName": { "value": "${AZURE_ENV_NAME}" },
+    "location": { "value": "${AZURE_LOCATION}" },
+    "scriptPayloadPart1": { "value": "${VM_SCRIPT_PAYLOAD_1}" },
+    "scriptPayloadPart2": { "value": "${VM_SCRIPT_PAYLOAD_2}" },
+    "scriptPayloadPart3": { "value": "${VM_SCRIPT_PAYLOAD_3}" },
+    "adminPassword": { "value": "${VM_ADMIN_PASSWORD}" },
+    "vmSize": { "value": "${APP_MOD_VM_SIZE}" },
+    "osDiskSizeGB": { "value": "${APP_MOD_OS_DISK_SIZE_GB}" },
+    "autoShutdownEnabled": { "value": "${APP_MOD_AUTO_SHUTDOWN_ENABLED}" },
+    "autoShutdownTime": { "value": "${APP_MOD_AUTO_SHUTDOWN_TIME}" }
+  }
+}
