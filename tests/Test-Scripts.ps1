@@ -629,6 +629,7 @@ exit 37
     $binDirectory = Split-Path $pythonPath -Parent
     $defaultPython = Join-Path $binDirectory 'python.exe'
     $script:DefaultIdentity = 'managed-python'
+    $script:DefaultExists = $true
     $script:ConflictName = ''
     $script:CurrentNode = $false
     $script:PersistentConflict = ''
@@ -638,6 +639,8 @@ exit 37
     function Get-NvmRuntimeDirectory { return $binDirectory }
     function Set-RuntimePath {
         param($Directory, $Executable, $Name)
+        Assert-NoRuntimeCommandConflict -Name $Name -ExpectedPath (Join-Path $Directory $Executable)
+        $null = Test-RuntimePath -Directory $Directory -Executable $Executable
         $calls.Add("path $Directory $Executable")
     }
     function Assert-NoRuntimeCommandConflict {
@@ -655,7 +658,7 @@ exit 37
     }
     function Test-Path {
         param($LiteralPath, $PathType)
-        if ($LiteralPath -eq $defaultPython) { return $true }
+        if ($LiteralPath -eq $defaultPython) { return $script:DefaultExists }
         return Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType
     }
     function Get-LatestNodeLts { return [pscustomobject]@{ Version = '26.13.1'; Lts = 'fixture' } }
@@ -669,6 +672,9 @@ exit 37
         }
         if ($CommandName -eq 'uv.exe' -and $Arguments[0] -eq 'python' -and $Arguments[1] -eq 'dir') {
             return $binDirectory
+        }
+        if ($CommandName -eq 'uv.exe' -and $Arguments -contains '--default') {
+            $script:DefaultExists = $true
         }
         if ($CommandName -eq $pythonPath -and $Arguments[0] -eq '--version') { return 'Python 3.14.2' }
         if ($CommandName -eq $pythonPath -and $Arguments[0] -eq '-c') { return 'managed-python' }
@@ -697,22 +703,26 @@ exit 37
     }
     $script:DefaultIdentity = 'managed-python'
     $script:ConflictName = 'python'
+    $script:DefaultExists = $false
     $calls.Clear()
     $failed = $false
     try { Install-PythonRuntime -PythonVersion '3.14' -LogDirectory 'temp' | Out-Null }
     catch { $failed = $_.Exception.Message -match 'fixture python conflict' }
     if (-not $failed -or $calls -notcontains 'uv.exe python install 3.14 --upgrade --no-config --no-progress' -or
-        $calls -contains 'uv.exe python install 3.14 --default --no-config --no-progress') {
-        throw 'A conflicting Python command did not stop default selection after managed installation.'
+        $calls -notcontains 'uv.exe python install 3.14 --default --no-config --no-progress' -or
+        -not $script:DefaultExists -or @($calls | Where-Object { $_ -like 'path *' }).Count -ne 0) {
+        throw 'A conflicting Python command prevented creation or allowed PATH changes.'
     }
     $script:ConflictName = ''
     $script:PersistentConflict = 'python.exe'
+    $script:DefaultExists = $false
     $calls.Clear()
     $failed = $false
     try { Install-PythonRuntime -PythonVersion '3.14' -LogDirectory 'temp' | Out-Null }
     catch { $failed = $_.Exception.Message -match 'python.exe PATH conflict' }
-    if (-not $failed -or $calls -contains 'uv.exe python install 3.14 --default --no-config --no-progress') {
-        throw 'A persistent PATH conflict did not prevent default Python selection.'
+    if (-not $failed -or $calls -notcontains 'uv.exe python install 3.14 --default --no-config --no-progress' -or
+        -not $script:DefaultExists -or @($calls | Where-Object { $_ -like 'path *' }).Count -ne 0) {
+        throw 'A persistent PATH conflict prevented creation or allowed PATH changes.'
     }
 }
 

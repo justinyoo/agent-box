@@ -1177,9 +1177,6 @@ function Install-PythonRuntime {
         throw 'uv did not return a valid Python executable directory.'
     }
     $defaultPython = Join-Path $binDirectory 'python.exe'
-    Update-ProcessPath
-    Assert-NoRuntimeCommandConflict -Name 'python' -ExpectedPath $defaultPython
-    $null = Test-RuntimePath -Directory $binDirectory -Executable 'python.exe'
     $identityCode = "print(__import__('os').path.realpath(__import__('sys').executable))"
     $managedIdentity = Invoke-ToolCommand -CommandName $pythonPath -Arguments @('-c', $identityCode) -LogDirectory $LogDirectory
     if ([string]::IsNullOrWhiteSpace($managedIdentity)) { throw 'Could not verify the uv-managed Python executable.' }
