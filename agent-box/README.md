@@ -1,15 +1,16 @@
 # Agent Box
 
-Agent Box provisions a Windows 11 Enterprise development VM, a Bastion Developer connection, a NAT Gateway, and one Microsoft Foundry account/project with a `MAI-Image-2.7` deployment. No tool installation or user sign-in is automated.
+Agent Box provisions a Windows 11 Enterprise development VM with Bastion Developer access and a NAT Gateway. It also creates a Microsoft Foundry account and project with a `MAI-Image-2.7` deployment. Tool installation and user sign-in are manual.
 
-## Requirements and defaults
+## Prerequisites
 
-- `azd` 1.35.1 or later and Azure CLI with Bicep support.
-- Azure permissions to create resource groups, Compute, Network, VM Run Command, and Microsoft Foundry resources.
-- Sufficient quota and capacity for the 64-vCPU VM, its disk, and the selected Foundry model deployment.
-- Eligibility to run Windows 11 client software in Azure. The required Bicep parameter asks for an explicit confirmation.
-- Azure CLI signed in with access to the azd environment's subscription.
-- A VM region in the allowlist in [`infra/main.bicep`](infra/main.bicep). The preprovision hook also queries the configured VM image, size, and availability zone for the subscription.
+- Azure Developer CLI (`azd`) 1.35.1 or later, and Azure CLI with Bicep support.
+- Azure permissions to create resource groups, Compute, Network, VM Run Command, and Microsoft Foundry resources. Azure CLI must be signed in with access to the azd environment's subscription.
+- Sufficient quota and capacity for the 64-vCPU VM, its disk, and the Foundry model deployment.
+- Eligibility to run Windows 11 client software in Azure. A required Bicep parameter asks for explicit confirmation.
+- A VM region in the allowlist in [`infra/main.bicep`](infra/main.bicep). The preprovision hook checks the configured VM image, size, and availability zone for the subscription.
+
+## Default resources
 
 | Setting | Default |
 | --- | --- |
@@ -22,45 +23,62 @@ Agent Box provisions a Windows 11 Enterprise development VM, a Bastion Developer
 | Outbound internet | NAT Gateway |
 | Automatic shutdown | Daily at 00:00 Korea Standard Time |
 
-The VM and Foundry regions are independent. The Foundry region is limited to `eastus`, `swedencentral`, `westeurope`, and `westus`, the overlap between the image model catalog and Speech model availability checked on 2026-11-21. This snapshot does not guarantee deployment or local inference. Confirm current model availability and quota before provisioning. `MAI_FOUNDRY_REGION` is saved in the azd environment and can be set explicitly to one of these regions; the template does not substitute a different model when deployment is unavailable.
+The VM and Foundry regions are independent. The Foundry region is limited to `eastus`, `swedencentral`, `westeurope`, and `westus`: the overlap between the image model catalog and Speech model availability checked on 2026-11-21. This snapshot does not guarantee deployment or local inference. Confirm current model availability and quota before provisioning.
 
 ## Provision
 
-Run from the `agent-box` directory:
+From the repository root, run:
 
 ```console
 cd agent-box
 azd auth login
 az login
 azd env new <environment-name> --location <azure-region>
-azd up
 ```
 
-azd prompts for the secure Windows administrator password, Windows client license confirmation, and other missing values. To change the local administrator name before provisioning, run `azd env set VM_ADMIN_USERNAME <username>`; otherwise it defaults to `agentboxuser`. For non-interactive provisioning, set `MAI_FOUNDRY_REGION` and, after confirming eligibility, run `azd env config set infra.parameters.confirmWindowsClientLicense true`. The former `CONFIRM_WINDOWS_CLIENT_LICENSE` environment variable is no longer used.
+### Configure the deployment
 
-The initial region picker lists regions where Bastion Developer is documented and both the default VM image and VM size appeared in Azure CLI lookups on 2026-11-22. The SKU lookup included subscription-restricted entries and did not filter regions by availability zone. A listed SKU does not guarantee availability for a particular subscription. This snapshot was taken with one subscription, may omit other supported regions, and also applies when a custom image or VM size is configured.
+- To change the local administrator name before provisioning, run `azd env set VM_ADMIN_USERNAME <username>`. The default is `agentboxuser`.
+- To set the independent Foundry region, run `azd env set MAI_FOUNDRY_REGION <region>` with one of the regions listed above. The value is saved in the azd environment. The template does not substitute a different model when deployment is unavailable.
+- For non-interactive provisioning, set `MAI_FOUNDRY_REGION` and, after confirming Windows client eligibility, run `azd env config set infra.parameters.confirmWindowsClientLicense true`. The former `CONFIRM_WINDOWS_CLIENT_LICENSE` environment variable is no longer used.
 
-Before provisioning, the hook checks the image and VM size in the selected subscription and chooses the lowest-numbered unrestricted availability zone. Set `VM_ZONE` explicitly with `azd env set VM_ZONE <zone>` to select a different supported zone. The chosen value is saved in the azd environment and reused on subsequent runs; to select automatically again, clear it with `azd env set VM_ZONE ""`. If a previously deployed VM is recorded in the environment, its existing zone is verified and retained, and a conflicting override stops provisioning. A missing or restricted zone, incomplete zone information, or a failed lookup also stops provisioning; non-zonal deployment is not supported by this template. The check cannot guarantee quota or capacity. If a lookup fails, check Azure CLI authentication and subscription access.
+Override other supported settings with `azd env set`. Numeric and boolean values are accepted as strings and validated during deployment. See [`infra/main.bicep`](infra/main.bicep) and [`infra/main.parameters.json`](infra/main.parameters.json) for the full input mapping.
 
-You can override supported settings with `azd env set`. Numeric and boolean values are accepted as strings and validated during deployment. See [`infra/main.bicep`](infra/main.bicep) and [`infra/main.parameters.json`](infra/main.parameters.json) for the full input mapping.
+When the settings are ready, run `azd up`. azd prompts for the secure Windows administrator password, Windows client license confirmation, and other missing values.
+
+### VM regions and availability zones
+
+The initial region picker uses a snapshot of regions where Bastion Developer is documented and both the default VM image and VM size appeared in Azure CLI lookups on 2026-11-22. The SKU lookup included subscription-restricted entries and did not filter regions by availability zone. The snapshot was taken with one subscription, may omit other supported regions, and also applies when a custom image or VM size is configured. A listed SKU does not guarantee availability for a particular subscription.
+
+Before provisioning, the hook checks the image and VM size in the selected subscription and chooses the lowest-numbered unrestricted availability zone. To select a different supported zone, run `azd env set VM_ZONE <zone>`. The selected value is saved in the azd environment and reused on subsequent runs. To select automatically again, clear it with `azd env set VM_ZONE ""`.
+
+If a previously deployed VM is recorded in the environment, the hook verifies and retains its existing zone. A conflicting override stops provisioning. A missing or restricted zone, incomplete zone information, or a failed lookup also stops provisioning; this template does not support non-zonal deployment. The check cannot guarantee quota or capacity. If a lookup fails, check Azure CLI authentication and subscription access.
+
+### Resource names
 
 Resource names follow the azd starter pattern: `rg-{environmentName}` for the resource group and type-specific prefixes such as `vm-`, `vnet-`, and `nsg-` followed by a token derived from the subscription, environment, and VM region. The Foundry account and project use the same token followed by the Foundry region, for example `cogsvc-{resourceToken}-eastus`. Changing the VM region changes the token; changing the Foundry region changes its name suffix. VM and Windows computer name overrides remain available.
 
 ## Connect and install tools
 
-After `azd provision` or `azd up`, the output shows the configured Windows login username. Connect in Azure portal at **Virtual machines > your VM > Connect > Bastion**. Sign in as `.\<username>` using that local administrator name (default `agentboxuser`) and the password entered during provisioning. Open PowerShell as administrator under that same account and run:
+The postprovision output in `azd provision` and `azd up` shows the configured Windows login username. The repository's installer is a template populated with the configured administrator name during deployment. Use the staged file rather than executing the raw repository file directly.
 
-```powershell
-& "$HOME\scripts\install-vm-tools.ps1"
-```
+1. In the Azure portal, open **Virtual machines > your VM > Connect > Bastion**.
+2. Sign in as `.\<username>` using the displayed local administrator name (default `agentboxuser`) and the password entered during provisioning.
+3. Open PowerShell as administrator under that same account and run:
 
-The installer displays numbered stages and status messages, and asks before each installation and setup change. To approve all listed actions and package terms in one run:
+   ```powershell
+   & "$HOME\scripts\install-vm-tools.ps1"
+   ```
+
+The installer displays numbered stages and status messages, and asks before each installation and setup change. To approve all listed actions and package terms in one run, use:
 
 ```powershell
 & "$HOME\scripts\install-vm-tools.ps1" -Yes
 ```
 
-Windows PowerShell 5.1 prepares WinGet and PowerShell 7.x, then reruns the installer in PowerShell 7.x. If a restart is requested, restart Windows manually and rerun the command. The installer does not authenticate Azure or GitHub tools, sign in to the Copilot app, launch Docker Desktop, create the first Ubuntu user, or automatically reboot Windows. Logs are written below `C:\ProgramData\AgentBox\Logs\DevTools`: `install.log` contains the transcript, and major installation and verification commands have separate `command-*.stdout.log` and `command-*.stderr.log` files.
+Windows PowerShell 5.1 prepares WinGet and PowerShell 7.x, then reruns the installer in PowerShell 7.x. If a restart is requested, restart Windows manually and rerun the command.
+
+### Installed tools
 
 | Group | Installs |
 | --- | --- |
@@ -75,15 +93,23 @@ Windows PowerShell 5.1 prepares WinGet and PowerShell 7.x, then reruns the insta
 | Azure | Azure CLI and Azure Developer CLI (`azd`) |
 | Editor and app | Visual Studio Code and the official GitHub Copilot app for Windows |
 
-Existing tools and unrelated Python/Node installations are preserved. The installer uses the stable nvm-windows 2.x WinGet package and does not replace an existing nvm 1.x installation. The Copilot app uses the official `github/app` x64 MSI and a valid GitHub Authenticode signature; the release SHA-256 digest is checked when GitHub publishes one.
+Existing tools and unrelated Python and Node installations are preserved:
 
-For Copilot CLI, the installer checks `copilot --version` before and after installation, preserving a working CLI even if WinGet does not list it. A pending Windows restart stops installation and must be completed manually.
+- The installer uses the stable nvm-windows 2.x WinGet package and does not replace an existing nvm 1.x installation.
+- The Copilot app uses the official `github/app` x64 MSI and a valid GitHub Authenticode signature. The release SHA-256 digest is checked when GitHub publishes one.
+- For Copilot CLI, the installer checks `copilot --version` before and after installation, preserving a working CLI even if WinGet does not list it.
+
+### Python and runtime paths
 
 Python installation is attempted even if Node.js setup fails; the installer still reports the Node.js failure. The Python patch version is the latest available in the installed uv release's download catalog. If no conflicting uv-bin executable exists, the installer uses uv's experimental `--default` option to create `python.exe` even when another Python command takes precedence. It then reports any command or PATH conflict for manual resolution without changing PATH order. Use `uv python list --only-installed` to check uv-managed installations.
 
-The installer preserves existing PATH entries and their order. When needed and there is no conflict, it asks before appending the runtime directory to the signed-in user's PATH (`-Yes` approves this); it never changes the system PATH for runtime priority. A conflicting `node` or `python`, including a WindowsApps alias, must be resolved manually before activation. Existing terminals may need to be reopened or the user signed out and back in. Previous versions of this installer may already have modified the system PATH; this version does not undo those changes.
+The installer preserves existing PATH entries and their order. When needed and there is no conflict, it asks before appending the runtime directory to the signed-in user's PATH (`-Yes` approves this). It never changes the system PATH for runtime priority. A conflicting `node` or `python`, including a WindowsApps alias, must be resolved manually before activation. Existing terminals may need to be reopened or the user signed out and back in. Previous versions of this installer may already have modified the system PATH; this version does not undo those changes.
 
-The repository's installer is a template populated with the configured administrator name during deployment. Use the staged file rather than executing the raw repository file directly.
+### Restart and logs
+
+A pending Windows restart stops installation and must be completed manually. The installer does not automatically reboot Windows, authenticate Azure or GitHub tools, sign in to the Copilot app, launch Docker Desktop, or create the first Ubuntu user.
+
+Logs are written below `C:\ProgramData\AgentBox\Logs\DevTools`. The `install.log` file contains the transcript; major installation and verification commands have separate `command-*.stdout.log` and `command-*.stderr.log` files.
 
 ### Manual post-install checks
 
