@@ -474,13 +474,24 @@ function Get-WslExecutable {
     if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
 }
 
+function Invoke-WslCommand {
+    param([string]$Executable, [string[]]$Arguments)
+
+    # A missing WSL installation reports status on stderr; inspect its exit code before deciding what to do.
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    $global:LASTEXITCODE = $null
+    $text = (& $Executable @Arguments 2>&1 | Out-String) -replace "`0", ''
+    if ($null -eq $LASTEXITCODE) { throw "$Executable did not return an exit code." }
+    return [pscustomobject]@{ Code = $LASTEXITCODE; Text = $text.Trim() }
+}
+
 function Test-WslPlatform {
     $wsl = Get-WslExecutable
     if (-not $wsl) { return $false }
     $feature = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop
     if ($feature.State -ne 'Enabled') { return $false }
-    $null = & $wsl --status 2>&1
-    return $LASTEXITCODE -eq 0
+    return (Invoke-WslCommand $wsl @('--status')).Code -eq 0
 }
 
 function Install-WslPlatform {
@@ -512,14 +523,14 @@ function Install-WslPlatform {
         Write-InstallMessage '[MANUAL] Skipped the WSL2 platform installation.'
         return $false
     }
-    $null = & $wsl --install --no-distribution 2>&1
-    $code = $LASTEXITCODE
+    $result = Invoke-WslCommand $wsl @('--install', '--no-distribution')
+    $code = $result.Code
     if ($code -in @(1641, 3010) -or (Test-RebootPending)) {
         $script:RestartRequired = $true
         Write-InstallMessage '[MANUAL] WSL2 needs a Windows restart. Restart manually and rerun this script.'
         return $false
     }
-    if ($code -ne 0) { throw "WSL2 platform installation failed (exit code $code)." }
+    if ($code -ne 0) { throw "WSL2 platform installation failed (exit code $code): $($result.Text)" }
     if (-not (Test-WslPlatform)) {
         $script:RestartRequired = $true
         Write-InstallMessage '[MANUAL] WSL2 becomes available after a Windows restart. Restart manually and rerun this script.'
@@ -531,9 +542,9 @@ function Install-WslPlatform {
 
 function Get-UbuntuWslVersion {
     $wsl = Get-WslExecutable
-    $text = (& $wsl --list --verbose 2>&1 | Out-String) -replace "`0", ''
-    $code = $LASTEXITCODE
-    if ($code -ne 0) {
+    $result = Invoke-WslCommand $wsl @('--list', '--verbose')
+    $text = $result.Text
+    if ($result.Code -ne 0) {
         if ($text -match 'Windows Subsystem for Linux has no installed distributions') { return 0 }
         throw "Could not list WSL distributions: $text"
     }
@@ -559,14 +570,14 @@ function Install-UbuntuWsl {
         return $false
     }
     $wsl = Get-WslExecutable
-    $null = & $wsl --install --distribution Ubuntu --no-launch 2>&1
-    $code = $LASTEXITCODE
+    $result = Invoke-WslCommand $wsl @('--install', '--distribution', 'Ubuntu', '--no-launch')
+    $code = $result.Code
     if ($code -in @(1641, 3010) -or (Test-RebootPending)) {
         $script:RestartRequired = $true
         Write-InstallMessage '[MANUAL] Ubuntu requires a Windows restart. Restart manually and rerun this script.'
         return $false
     }
-    if ($code -ne 0) { throw "Ubuntu installation failed (exit code $code)." }
+    if ($code -ne 0) { throw "Ubuntu installation failed (exit code $code): $($result.Text)" }
     if ((Get-UbuntuWslVersion) -ne 2) {
         throw 'Ubuntu was not verified as a WSL2 distribution. Check WSL status and rerun.'
     }

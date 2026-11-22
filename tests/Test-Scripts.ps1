@@ -47,6 +47,89 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
 }
 
 & {
+    Set-StrictMode -Version Latest
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
+    foreach ($name in @('Invoke-WslCommand', 'Test-WslPlatform', 'Install-WslPlatform',
+            'Get-UbuntuWslVersion', 'Install-UbuntuWsl')) {
+        $definition = $ast.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+        }, $true)
+        if (-not $definition) { throw "Missing Agent Box WSL function: $name" }
+        Invoke-Expression $definition.Extent.Text
+    }
+
+    $PSNativeCommandUseErrorActionPreference = $true
+    $executable = (Get-Process -Id $PID).Path
+    $result = Invoke-WslCommand $executable @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+        '[Console]::Error.WriteLine("WSL is not installed"); exit 42')
+    if ($result.Code -ne 42 -or $result.Text -notmatch 'WSL is not installed') {
+        throw 'A native WSL error did not preserve its exit code and diagnostic output.'
+    }
+    $result = Invoke-WslCommand $executable @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+        '[Console]::Out.WriteLine("WSL ready"); exit 0')
+    if ($result.Code -ne 0 -or $result.Text -notmatch 'WSL ready') {
+        throw 'A successful native WSL command was not reported correctly.'
+    }
+
+    $script:WslReady = $false
+    $script:WslInstallCode = 0
+    $script:WslCalls = [Collections.Generic.List[string]]::new()
+    $script:RestartRequired = $false
+    function Get-WslExecutable { return 'fixture-wsl.exe' }
+    function Get-WindowsOptionalFeature { return [pscustomobject]@{ State = 'Enabled' } }
+    function Test-RebootPending { return $false }
+    function Confirm-InstallAction { return $true }
+    function Write-InstallMessage { }
+    function Invoke-WslCommand {
+        param($Executable, $Arguments)
+        $command = $Arguments -join ' '
+        $script:WslCalls.Add($command)
+        switch ($command) {
+            '--status' {
+                if ($script:WslReady) { return [pscustomobject]@{ Code = 0; Text = 'ready' } }
+                return [pscustomobject]@{ Code = 1; Text = 'The Windows Subsystem for Linux is not installed.' }
+            }
+            '--install --no-distribution' {
+                if ($script:WslInstallCode -eq 0) { $script:WslReady = $true }
+                return [pscustomobject]@{ Code = $script:WslInstallCode; Text = 'fixture installation error' }
+            }
+            '--list --verbose' {
+                return [pscustomobject]@{ Code = 1; Text = 'Windows Subsystem for Linux has no installed distributions.' }
+            }
+            '--install --distribution Ubuntu --no-launch' {
+                return [pscustomobject]@{ Code = $script:WslInstallCode; Text = 'fixture Ubuntu error' }
+            }
+            default { throw "Unexpected WSL command: $command" }
+        }
+    }
+    if (-not (Install-WslPlatform) -or
+        ($script:WslCalls -join ',') -cne '--status,--install --no-distribution,--status') {
+        throw 'Missing WSL did not reach the platform installer and subsequent readiness check.'
+    }
+    if ((Get-UbuntuWslVersion) -ne 0) { throw 'An empty WSL distribution list was not accepted.' }
+    $script:WslReady = $false
+    $script:WslInstallCode = 42
+    $failed = $false
+    try { Install-WslPlatform | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'exit code 42.*fixture installation error' }
+    if (-not $failed) { throw 'A WSL installation failure did not report its exit code and diagnostics.' }
+    $script:WslInstallCode = 3010
+    if ((Install-WslPlatform) -or -not $script:RestartRequired) {
+        throw 'A WSL restart-required exit code was not preserved.'
+    }
+    $script:RestartRequired = $false
+    $script:WslReady = $true
+    $script:WslInstallCode = 42
+    $failed = $false
+    try { Install-UbuntuWsl | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'exit code 42.*fixture Ubuntu error' }
+    if (-not $failed) { throw 'An Ubuntu installation failure did not report its exit code and diagnostics.' }
+}
+
+& {
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
