@@ -20,8 +20,6 @@
 
 `latest`는 새 VM을 만들 때 해당 SKU의 최신 이미지를 사용한다는 뜻입니다. 기존 VM의 이미지를 갱신하거나 다른 SKU로 전환하지는 않습니다.
 
-VM은 Entra ID 로그인과 Managed Identity를 사용하지 않습니다. 배포와 Azure portal 접속에는 Azure 로그인이 필요합니다.
-
 ## 사전 준비
 
 - [Azure 구독](https://aka.ms/azure/free)
