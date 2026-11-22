@@ -1,6 +1,23 @@
 # Agent Box
 
+[Repository template guide](../README.md)
+
 Agent Box provisions a Windows 11 Enterprise development VM with Bastion Developer access and a NAT Gateway. It also creates a Microsoft Foundry account and project with a `MAI-Image-2.7` deployment. Tool installation and user sign-in are manual.
+
+## Default configuration
+
+| Setting | Value |
+| --- | --- |
+| Image | `microsoftwindowsdesktop:windows-11:win11-26h2-ent:latest` |
+| VM | `Standard_D64ds_v7` |
+| OS disk | Premium SSD, 127 GiB |
+| Boot security | Trusted Launch, Secure Boot, vTPM |
+| Windows login | Default `.\agentboxuser`, local administrator |
+| Access | Bastion Developer in the Azure portal; no VM public IP or public RDP rule |
+| Network | Internet access through NAT Gateway |
+| Automatic shutdown | Daily at 00:00 Korea Standard Time |
+
+The VM and Foundry regions are independent. The Foundry region is limited to `eastus`, `swedencentral`, `westeurope`, and `westus`: the overlap between the image model catalog and Speech model availability checked on 2026-11-21. This snapshot does not guarantee deployment or local inference. Confirm current model availability and quota before provisioning.
 
 ## Prerequisites
 
@@ -10,43 +27,56 @@ Agent Box provisions a Windows 11 Enterprise development VM with Bastion Develop
 - Eligibility to run Windows 11 client software in Azure. A required Bicep parameter asks for explicit confirmation.
 - A VM region in the allowlist in [`infra/main.bicep`](infra/main.bicep). The preprovision hook checks the configured VM image, size, and availability zone for the subscription.
 
-## Default resources
+## Deploy
 
-| Setting | Default |
-| --- | --- |
-| VM | `Standard_D64ds_v7` |
-| Image | `microsoftwindowsdesktop:windows-11:win11-26h2-ent:latest` |
-| Boot security | Trusted Launch, Secure Boot, and vTPM |
-| Local administrator | `agentboxuser` |
-| OS disk | 127 GiB Premium SSD |
-| Network access | Bastion Developer; no VM public IP or public RDP rule |
-| Outbound internet | NAT Gateway |
-| Automatic shutdown | Daily at 00:00 Korea Standard Time |
+1. Change to the `agent-box` directory.
 
-The VM and Foundry regions are independent. The Foundry region is limited to `eastus`, `swedencentral`, `westeurope`, and `westus`: the overlap between the image model catalog and Speech model availability checked on 2026-11-21. This snapshot does not guarantee deployment or local inference. Confirm current model availability and quota before provisioning.
+   ```bash
+   cd agent-box
+   ```
 
-## Provision
+1. If running the azd CLI in the Copilot app terminal, set the environment variable as follows.
 
-From the repository root, run:
+   ```bash
+   # zsh/bash
+   export AZD_NON_INTERACTIVE=false
+   ```
 
-```console
-cd agent-box
-azd auth login
-az login
-azd env new <environment-name> --location <azure-region>
-```
+   ```powershell
+   # PowerShell
+   $env:AZD_NON_INTERACTIVE = 'false'
+   ```
 
-### Configure the deployment
+1. Sign in to Azure.
 
-- To change the local administrator name before provisioning, run `azd env set VM_ADMIN_USERNAME <username>`. The default is `agentboxuser`.
-- To set the independent Foundry region, run `azd env set MAI_FOUNDRY_REGION <region>` with one of the regions listed above. The value is saved in the azd environment. The template does not substitute a different model when deployment is unavailable.
-- For non-interactive provisioning, set `MAI_FOUNDRY_REGION` and, after confirming Windows client eligibility, run `azd env config set infra.parameters.confirmWindowsClientLicense true`. The former `CONFIRM_WINDOWS_CLIENT_LICENSE` environment variable is no longer used.
+   ```bash
+   azd auth login
+   az login
+   ```
+
+1. Create an azd environment.
+
+   ```bash
+   azd env new <environment-name> --location <azure-region>
+   ```
+
+1. Optionally, configure the environment before deployment.
+
+   To change the local administrator name, run `azd env set VM_ADMIN_USERNAME <username>`.
+
+   To set the independent Foundry region, run `azd env set MAI_FOUNDRY_REGION <region>` with one of the regions listed above. The value is saved in the azd environment. The template does not substitute a different model when deployment is unavailable.
+
+   For non-interactive provisioning, set `MAI_FOUNDRY_REGION` and, after confirming Windows client eligibility, run `azd env config set infra.parameters.confirmWindowsClientLicense true`. The former `CONFIRM_WINDOWS_CLIENT_LICENSE` environment variable is no longer used.
+
+1. Start the deployment.
+
+   ```bash
+   azd up
+   ```
+
+   azd prompts for the secure Windows administrator password, Windows client license confirmation, and other missing values.
 
 Override other supported settings with `azd env set`. Numeric and boolean values are accepted as strings and validated during deployment. See [`infra/main.bicep`](infra/main.bicep) and [`infra/main.parameters.json`](infra/main.parameters.json) for the full input mapping.
-
-When the settings are ready, run `azd up`. azd prompts for the secure Windows administrator password, Windows client license confirmation, and other missing values.
-
-### VM regions and availability zones
 
 The initial region picker uses a snapshot of regions where Bastion Developer is documented and both the default VM image and VM size appeared in Azure CLI lookups on 2026-11-22. The SKU lookup included subscription-restricted entries and did not filter regions by availability zone. The snapshot was taken with one subscription, may omit other supported regions, and also applies when a custom image or VM size is configured. A listed SKU does not guarantee availability for a particular subscription.
 
@@ -54,71 +84,68 @@ Before provisioning, the hook checks the image and VM size in the selected subsc
 
 If a previously deployed VM is recorded in the environment, the hook verifies and retains its existing zone. A conflicting override stops provisioning. A missing or restricted zone, incomplete zone information, or a failed lookup also stops provisioning; this template does not support non-zonal deployment. The check cannot guarantee quota or capacity. If a lookup fails, check Azure CLI authentication and subscription access.
 
-### Resource names
-
 Resource names follow the azd starter pattern: `rg-{environmentName}` for the resource group and type-specific prefixes such as `vm-`, `vnet-`, and `nsg-` followed by a token derived from the subscription, environment, and VM region. The Foundry account and project use the same token followed by the Foundry region, for example `cogsvc-{resourceToken}-eastus`. Changing the VM region changes the token; changing the Foundry region changes its name suffix. VM and Windows computer name overrides remain available.
 
-## Connect and install tools
+## Sign in and install tools
 
-The postprovision output in `azd provision` and `azd up` shows the configured Windows login username. The repository's installer is a template populated with the configured administrator name during deployment. Use the staged file rather than executing the raw repository file directly.
-
-1. In the Azure portal, open **Virtual machines > your VM > Connect > Bastion**.
-2. Sign in as `.\<username>` using the displayed local administrator name (default `agentboxuser`) and the password entered during provisioning.
-3. Open PowerShell as administrator under that same account and run:
+1. Find the Windows login username in the `azd provision` or `azd up` output. In the Azure portal, select **Connect > Bastion** for the VM, then sign in with that local administrator account (default: `.\agentboxuser`) and the password entered during provisioning.
+1. **Run PowerShell as administrator** under the same account.
+1. Run the following command and approve the requested actions.
 
    ```powershell
    & "$HOME\scripts\install-vm-tools.ps1"
    ```
 
-The installer displays numbered stages and status messages, and asks before each installation and setup change. To approve all listed actions and package terms in one run, use:
+   By default, the installer asks for approval for each installation and setup change. Adding `-Yes` approves all listed actions and package terms in one run.
 
-```powershell
-& "$HOME\scripts\install-vm-tools.ps1" -Yes
-```
+   ```powershell
+   & "$HOME\scripts\install-vm-tools.ps1" -Yes
+   ```
 
-Windows PowerShell 5.1 prepares WinGet and PowerShell 7.x, then reruns the installer in PowerShell 7.x. If a restart is requested, restart Windows manually and rerun the command.
+1. If prompted to restart, save your work, restart the VM manually, and rerun the same command.
 
-### Installed tools
+The repository's installer is a template populated with the configured administrator name during deployment. Use the staged file rather than executing the raw repository file directly.
 
-| Group | Installs |
-| --- | --- |
-| Package manager | WinGet |
-| Windows tooling | PowerShell 7 |
-| Windows features | WSL2 platform, Ubuntu on WSL2 |
-| .NET SDKs | .NET 10 SDK and .NET 11 SDK side by side |
-| JavaScript | nvm-windows and the latest stable Node.js LTS available when the installer runs |
-| Python | uv and the latest Python 3.14 patch available to uv |
-| Containers | Docker Desktop configured for its WSL2 backend |
-| Source control and GitHub | Git, GitHub CLI (`gh`), GitHub Copilot CLI |
-| Azure | Azure CLI and Azure Developer CLI (`azd`) |
-| Editor and app | Visual Studio Code and the official GitHub Copilot app for Windows |
+Windows PowerShell 5.1 prepares WinGet and PowerShell 7.x, then reruns the installer in PowerShell 7.x. A pending Windows restart stops installation and must be completed manually. The installer does not automatically reboot Windows, authenticate Azure or GitHub tools, sign in to the Copilot app, launch Docker Desktop, or create the first Ubuntu user.
 
-Existing tools and unrelated Python and Node installations are preserved:
+Logs are written below `C:\ProgramData\AgentBox\Logs\DevTools`. The `install.log` file contains the transcript; major installation and verification commands have separate `command-*.stdout.log` and `command-*.stderr.log` files.
 
-- The installer uses the stable nvm-windows 2.x WinGet package and does not replace an existing nvm 1.x installation.
-- The Copilot app uses the official `github/app` x64 MSI and a valid GitHub Authenticode signature. The release SHA-256 digest is checked when GitHub publishes one.
-- For Copilot CLI, the installer checks `copilot --version` before and after installation, preserving a working CLI even if WinGet does not list it.
+### Tools installed
 
-### Python and runtime paths
+The installer follows the order below and stops when a restart is required.
+
+| Group | Tool | Installation and verification |
+| --- | --- | --- |
+| 1. Installation prerequisites | WinGet | Register or install App Installer |
+| 1. Installation prerequisites | PowerShell | Stable 7.x release |
+| 2. Windows features | WSL2 platform | Install without a distribution using `wsl.exe --install --no-distribution`. Restart manually when requested |
+| 2. Windows features | Ubuntu | Register for the signed-in administrator account after WSL2 installation |
+| 3. Runtimes and SDKs | .NET 10 SDK | `Microsoft.DotNet.SDK.10`, stable 10.x release |
+| 3. Runtimes and SDKs | .NET 11 SDK | `Microsoft.DotNet.SDK.11`, stable 11.x release. Installed alongside .NET 10 |
+| 3. Runtimes and SDKs | uv | `astral-sh.uv` |
+| 3. Runtimes and SDKs | nvm-windows, Node.js | Stable nvm-windows 2.x package and the latest stable Node.js LTS available when the installer runs |
+| 3. Runtimes and SDKs | Python | uv and the latest Python 3.14 patch available to uv |
+| 4. Containers | Docker Desktop | Install with the WSL2 backend. First launch and terms review are manual |
+| 5. GitHub tools | Git | `Git.Git` |
+| 5. GitHub tools | GitHub CLI | `GitHub.cli`, 2.45.0 or later |
+| 5. GitHub tools | GitHub Copilot CLI | `GitHub.Copilot`. Verify with `copilot --version` |
+| 6. Azure tools | Azure CLI | `Microsoft.AzureCLI` |
+| 6. Azure tools | azd | `Microsoft.Azd` |
+| 7. Editors and apps | VS Code | `Microsoft.VisualStudioCode` |
+| 7. Editors and apps | GitHub Copilot app | Official `github/app` x64 MSI. Verify the GitHub Authenticode signature and the release SHA-256 digest when published |
+
+Existing tools and unrelated Python and Node installations are preserved. The installer does not replace an existing nvm 1.x installation. For Copilot CLI, it checks `copilot --version` before and after installation, preserving a working CLI even if WinGet does not list it.
 
 Python installation is attempted even if Node.js setup fails; the installer still reports the Node.js failure. The Python patch version is the latest available in the installed uv release's download catalog. If no conflicting uv-bin executable exists, the installer uses uv's experimental `--default` option to create `python.exe` even when another Python command takes precedence. It then reports any command or PATH conflict for manual resolution without changing PATH order. Use `uv python list --only-installed` to check uv-managed installations.
 
 The installer preserves existing PATH entries and their order. When needed and there is no conflict, it asks before appending the runtime directory to the signed-in user's PATH (`-Yes` approves this). It never changes the system PATH for runtime priority. A conflicting `node` or `python`, including a WindowsApps alias, must be resolved manually before activation. Existing terminals may need to be reopened or the user signed out and back in. Previous versions of this installer may already have modified the system PATH; this version does not undo those changes.
 
-### Restart and logs
-
-A pending Windows restart stops installation and must be completed manually. The installer does not automatically reboot Windows, authenticate Azure or GitHub tools, sign in to the Copilot app, launch Docker Desktop, or create the first Ubuntu user.
-
-Logs are written below `C:\ProgramData\AgentBox\Logs\DevTools`. The `install.log` file contains the transcript; major installation and verification commands have separate `command-*.stdout.log` and `command-*.stderr.log` files.
-
-### Manual post-install checks
-
-After the script completes:
+### Manual post-installation steps
 
 1. Restart Windows if requested, then rerun the installer until it reports successful verification.
-2. Run `wsl -d Ubuntu` to create the first Linux user.
-3. Start Docker Desktop, complete its first-run setup and terms, and verify Linux containers.
-4. Sign in to the Copilot app and authenticate the Azure/GitHub CLIs as needed.
+1. Run `wsl -d Ubuntu` to create the first Linux user.
+1. Start Docker Desktop, complete its first-run setup and terms, and verify Linux containers.
+1. Sign in to the Copilot app and authenticate the Azure/GitHub CLIs as needed.
 
 WSL2, Ubuntu, and Docker Desktop are installed by the script, but their operation must be verified manually on the deployed VM. Local tests do not perform these post-deployment checks.
 
@@ -146,7 +173,7 @@ Useful deployment outputs include:
 
 The template does not retrieve or emit account keys. It does not configure model inference permissions or test an inference request.
 
-## Cleanup
+## Clean up resources
 
 Back up data first. From the `agent-box` directory, remove only the intended azd environment:
 
