@@ -1,0 +1,9 @@
+{
+  "version": "1.0",
+  "components": [
+    "Microsoft.VisualStudio.Workload.WebBuildTools",
+    "Microsoft.VisualStudio.Workload.ManagedDesktopBuildTools",
+    "Microsoft.Net.Component.4.8.TargetingPack",
+    "Microsoft.Net.Component.4.8.SDK"
+  ]
+}

@@ -1,0 +1,37 @@
+# Microsoft Bastion Developer regional availability, checked 2026-11-21:
+# https://learn.microsoft.com/azure/bastion/bastion-sku-comparison#regional-availability
+australiacentral
+australiaeast
+australiasoutheast
+brazilsouth
+canadacentral
+canadaeast
+centralindia
+centralus
+centraluseuap
+eastasia
+eastus2
+eastus2euap
+francecentral
+germanywestcentral
+italynorth
+japaneast
+japanwest
+koreacentral
+koreasouth
+mexicocentral
+northcentralus
+northeurope
+norwayeast
+southafricanorth
+southindia
+southeastasia
+spaincentral
+swedencentral
+switzerlandnorth
+uaenorth
+uksouth
+ukwest
+westcentralus
+westeurope
+westus

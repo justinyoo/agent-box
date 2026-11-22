@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - uses: Azure/setup-azd@v2
+      - name: Install Bicep
+        run: az bicep install
+      - name: Validate templates and hooks
+        run: python3 tests/validate.py
+      - name: Validate PowerShell scripts
+        run: pwsh -NoLogo -NoProfile -File tests/Test-Scripts.ps1

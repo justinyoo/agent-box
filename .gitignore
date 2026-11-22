@@ -3,8 +3,12 @@
 .env.*
 !.env.example
 *.local.parameters.json
-infra/main.json
-infra/resources.json
-infra/foundry.json
+agent-box/infra/main.json
+agent-box/infra/modules/*.json
+appmod-box/infra/main.json
+appmod-box/infra/modules/*.json
+agent-box/infra/.generated/
+appmod-box/infra/.generated/
+appmod-box/infra/.test-output/
 *.log
 __pycache__/
