@@ -160,5 +160,3 @@ Back up data first. From the `agent-box` directory, remove only the intended azd
 ```console
 azd down --environment <environment-name>
 ```
-
-Stopping the VM does not remove charges for retained disks, the NAT Gateway, or public IP resources.
