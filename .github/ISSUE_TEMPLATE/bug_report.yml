@@ -1,0 +1,25 @@
+name: Bug report
+description: Report a problem with a template or script.
+title: "[Bug]: "
+labels: []
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem and the expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and relevant logs
+      description: Include the affected template and tool versions. Remove secrets and personal information.
+    validations:
+      required: false
