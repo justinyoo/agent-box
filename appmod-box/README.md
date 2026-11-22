@@ -1,6 +1,6 @@
 # Windows 11 Development VM
 
-[English](README.md) | [한국어](README.ko.md)
+**English** | [한국어](README.ko.md)
 
 [Repository template guide](../README.md)
 
