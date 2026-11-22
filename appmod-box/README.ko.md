@@ -60,12 +60,6 @@
    azd up
    ```
 
-   새 azd 환경에서는 파라미터 입력 단계에서 Windows 클라이언트 라이선스 자격을 확인합니다. 비대화형으로 배포할 때는 자격을 확인한 후 `azd env config set infra.parameters.confirmWindowsClientLicense true`를 실행하세요. 기존 `CONFIRM_WINDOWS_CLIENT_LICENSE` 환경 변수는 더 이상 사용하지 않습니다. VM 관리자 암호는 azd의 보안 프롬프트에 입력합니다.
-
-azd에서 처음 선택할 수 있는 지역은 [`infra/main.bicep`](infra/main.bicep)에 나열된 지역으로 제한됩니다. 이 목록은 Bastion Developer와 기본 VM 이미지가 모두 지원되는 지역을 확인 당시 기록한 것으로, 실시간 조회 결과가 아닙니다. 배포 전에 선택한 지역의 Bastion Developer 지원 여부와 해당 구독에서 사용할 VM 이미지와 크기를 다시 확인합니다. 이 확인은 실제 할당량이나 용량을 보장하지 않습니다. 목록의 다른 지역을 선택하려면 `azd env set AZURE_LOCATION <region>`을 실행하세요.
-
-워크숍 설정은 `azd env set`으로 변경할 수 있습니다. 관리자 이름을 변경하려면 배포 전에 `azd env set VM_ADMIN_USERNAME <username>`을 실행하세요. 예를 들어 한국 시간 오후 9시에 자동 종료하려면 `azd env set APP_MOD_AUTO_SHUTDOWN_TIME 2100`을 실행하세요. 시간은 `0000`부터 `2359`까지의 유효한 24시간제 `HHmm` 형식으로 입력합니다. `APP_MOD_AUTO_SHUTDOWN_ENABLED`로 자동 종료를 켜거나 끄고, `APP_MOD_VM_SIZE`와 `APP_MOD_OS_DISK_SIZE_GB`로 VM 크기와 OS 디스크 크기를 설정할 수 있습니다. 값을 지정하지 않은 경우에만 기본값을 적용합니다.
-
 ## 로그인과 도구 설치
 
 1. `azd provision` 또는 `azd up` 출력에서 Windows 로그인 사용자 이름을 확인합니다. Azure portal에서 VM의 **연결 > Bastion**을 선택하고 해당 로컬 관리자 계정(기본값 `.\appmoduser`)과 배포 시 입력한 암호로 로그인합니다.
