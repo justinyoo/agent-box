@@ -265,13 +265,14 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     }
     function Install-CopilotApp { $events.Add('copilot-app'); return $true }
     function Test-DevToolCommands { param([string]$LogDirectory) $events.Add('verification') }
+    function Test-RuntimeCommands { param([string]$LogDirectory) $events.Add('runtime-verification') }
     if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 0) {
         throw 'Agent Box installation did not report success.'
     }
     $expectedEvents = @(
         'winget', 'packages:Prerequisites', 'wsl', 'ubuntu', 'packages:Runtimes',
         'nvm', 'node', 'python:3.14', 'packages:Containers', 'packages:GitHub',
-        'packages:Azure', 'packages:Editors', 'copilot-app', 'verification'
+        'packages:Azure', 'packages:Editors', 'copilot-app', 'verification', 'runtime-verification'
     )
     if (($events -join ',') -cne ($expectedEvents -join ',')) {
         throw "Unexpected Agent Box installation order: $($events -join ',')."
@@ -282,16 +283,16 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
         if (-not $stages[$index].Contains("[$($index + 1)/7]")) {
             throw 'Agent Box installation stage numbers are out of order.'
         }
-        $events.Clear()
-        $messages.Clear()
-        $nodeFailure = $true
-        if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 1 -or
-            $events -notcontains 'python:3.14' -or
-            -not ($messages | Where-Object { $_ -match '^\[FAIL\] Node\.js installation failed: fixture Node failure' })) {
-            throw 'A Node.js failure prevented Python installation or was not reported.'
-        }
-        $nodeFailure = $false
     }
+    $events.Clear()
+    $messages.Clear()
+    $nodeFailure = $true
+    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 1 -or
+        $events -notcontains 'python:3.14' -or
+        -not ($messages | Where-Object { $_ -match '^\[FAIL\] Node\.js installation failed: fixture Node failure' })) {
+        throw 'A Node.js failure prevented Python installation or was not reported.'
+    }
+    $nodeFailure = $false
     $packageFailure = 'restart'
     if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 3010) {
         throw 'Agent Box did not return the restart-required status.'
@@ -326,9 +327,26 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     $calls = [Collections.Generic.List[string]]::new()
     $script:NodeOutput = '{"version":"26.13.1","lts":"fixture","arch":"x64"}'
     $pythonPath = (Get-Process -Id $PID).Path
+    $binDirectory = Split-Path $pythonPath -Parent
+    $defaultPython = Join-Path $binDirectory 'python.exe'
+    $script:DefaultIdentity = 'managed-python'
     function Confirm-InstallAction { return $true }
     function Write-InstallMessage { }
     function Update-ProcessPath { }
+    function Get-NvmRuntimeDirectory { return $binDirectory }
+    function Set-RuntimePathPriority {
+        param($Directory, $Executable)
+        $calls.Add("priority $Directory $Executable")
+    }
+    function Assert-RuntimeCommand {
+        param($Name, $ExpectedPath)
+        $calls.Add("resolve $Name $ExpectedPath")
+    }
+    function Test-Path {
+        param($LiteralPath, $PathType)
+        if ($LiteralPath -eq $defaultPython) { return $true }
+        return Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType
+    }
     function Get-LatestNodeLts { return [pscustomobject]@{ Version = '26.13.1'; Lts = 'fixture' } }
     function Get-NvmVersion { return '2.0.1' }
     function Invoke-ToolCommand {
@@ -338,16 +356,33 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
         if ($CommandName -eq 'uv.exe' -and $Arguments[0] -eq 'python' -and $Arguments[1] -eq 'find') {
             return $pythonPath
         }
-        if ($CommandName -eq $pythonPath) { return 'Python 3.14.2' }
+        if ($CommandName -eq 'uv.exe' -and $Arguments[0] -eq 'python' -and $Arguments[1] -eq 'dir') {
+            return $binDirectory
+        }
+        if ($CommandName -eq $pythonPath -and $Arguments[0] -eq '--version') { return 'Python 3.14.2' }
+        if ($CommandName -eq $pythonPath -and $Arguments[0] -eq '-c') { return 'managed-python' }
+        if ($CommandName -eq $defaultPython -and $Arguments[0] -eq '-c') { return $script:DefaultIdentity }
         return ''
     }
     if (-not (Install-NodeRuntime -LogDirectory 'temp')) { throw 'Valid Node runtime was not accepted.' }
     if (-not (Install-PythonRuntime -PythonVersion '3.14' -LogDirectory 'temp')) {
         throw 'The uv-managed Python installation was not verified.'
     }
-    if ($calls -notcontains 'uv.exe python install 3.14 --upgrade --no-config --no-progress' -or
-        $calls -notcontains 'uv.exe python find cpython3.14 --managed-python --no-python-downloads --no-project --system --no-config') {
+    if ($calls -notcontains 'uv.exe python install 3.14 --upgrade --default --no-config --no-progress' -or
+        $calls -notcontains 'uv.exe python find cpython3.14 --managed-python --no-python-downloads --no-project --system --no-config' -or
+        $calls -notcontains 'uv.exe python dir --bin --no-config' -or
+        $calls -notcontains "priority $binDirectory node.exe" -or
+        $calls -notcontains "priority $binDirectory python.exe" -or
+        $calls -notcontains "resolve python $defaultPython") {
         throw 'The latest Python 3.14 patch was not installed and located through uv.'
+    }
+    $calls.Clear()
+    $script:DefaultIdentity = 'unrelated-python'
+    $failed = $false
+    try { Install-PythonRuntime -PythonVersion '3.14' -LogDirectory 'temp' | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'not the selected uv-managed interpreter' }
+    if (-not $failed -or @($calls | Where-Object { $_ -like 'priority *' }).Count -ne 0) {
+        throw 'An unrelated Python in the uv bin directory was accepted or prioritized.'
     }
     $script:NodeOutput = ''
     $failed = $false
@@ -359,6 +394,136 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     try { Install-NodeRuntime -LogDirectory 'temp' | Out-Null }
     catch { $failed = $_.Exception.Message -match 'Active Node.js does not match' }
     if (-not $failed) { throw 'A null Node runtime response did not produce an actionable error.' }
+}
+
+& {
+    Set-StrictMode -Version Latest
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
+    foreach ($name in @('Get-PrioritizedRuntimePath', 'Set-RuntimePathPriority', 'Get-NvmRuntimeDirectory', 'Assert-RuntimeCommand', 'Test-RuntimeCommands')) {
+        $definition = $ast.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+        }, $true)
+        if (-not $definition) { throw "Missing runtime PATH function: $name" }
+        Invoke-Expression $definition.Extent.Text
+    }
+    $fixture = Join-Path ([IO.Path]::GetTempPath()) ("agentbox-path-" + [guid]::NewGuid().ToString('N'))
+    $originalFixtureEnv = $env:AGENTBOX_PATH_FIXTURE
+    $originalNvmSymlink = $env:NVM_SYMLINK
+    $originalLocalAppData = $env:LOCALAPPDATA
+    $originalPath = $env:Path
+    try {
+        $preferred = Join-Path $fixture 'preferred'
+        $conflict = Join-Path $fixture 'conflict'
+        $other = Join-Path $fixture 'other'
+        foreach ($directory in @($preferred, $conflict, $other)) {
+            $null = [IO.Directory]::CreateDirectory($directory)
+        }
+        [IO.File]::WriteAllText((Join-Path $preferred 'python.exe'), '')
+        [IO.File]::WriteAllText((Join-Path $conflict 'python.exe'), '')
+        $env:AGENTBOX_PATH_FIXTURE = $fixture
+        $script:PathValues = @{ User = "$other;%AGENTBOX_PATH_FIXTURE%/preferred;$preferred"; Machine = $other }
+        $writes = [Collections.Generic.List[string]]::new()
+        $script:AllowMachine = $true
+        function Get-PersistentRuntimePath { param($Scope) return $script:PathValues[$Scope] }
+        function Set-PersistentRuntimePath {
+            param($Scope, $Value)
+            $script:PathValues[$Scope] = $Value
+            $writes.Add($Scope)
+        }
+        function Confirm-InstallAction { return $script:AllowMachine }
+        function Write-InstallMessage { }
+        function Update-ProcessPath { }
+        Set-RuntimePathPriority -Directory $preferred -Executable 'python.exe'
+        if ($script:PathValues.User -cne "$preferred;$other" -or $writes.Count -ne 1 -or $writes[0] -ne 'User') {
+            throw 'User PATH was not prioritized and deduplicated without a system conflict.'
+        }
+        Set-RuntimePathPriority -Directory $preferred -Executable 'python.exe'
+        if ($writes.Count -ne 1) { throw 'Repeated PATH setup was not idempotent.' }
+        $script:PathValues.Machine = "%AGENTBOX_PATH_FIXTURE%/conflict;$other"
+        $writes.Clear()
+        Set-RuntimePathPriority -Directory $preferred -Executable 'python.exe'
+        if ($script:PathValues.Machine -cne "$preferred;%AGENTBOX_PATH_FIXTURE%/conflict;$other" -or
+            $writes.Count -ne 1 -or $writes[0] -ne 'Machine') {
+            throw 'System PATH conflict was not resolved while preserving unexpanded entries.'
+        }
+        Set-RuntimePathPriority -Directory $preferred -Executable 'python.exe'
+        if ($writes.Count -ne 1) { throw 'Repeated system PATH setup was not idempotent.' }
+        $script:PathValues.Machine = $conflict
+        $script:PathValues.User = $other
+        $script:AllowMachine = $false
+        $writes.Clear()
+        $failed = $false
+        try { Set-RuntimePathPriority -Directory $preferred -Executable 'python.exe' }
+        catch { $failed = $_.Exception.Message -match 'declined' }
+        if (-not $failed -or $writes.Count) { throw 'Declined system PATH change was not respected.' }
+        $failed = $false
+        try { Set-RuntimePathPriority -Directory $other -Executable 'python.exe' }
+        catch { $failed = $_.Exception.Message -match 'invalid' }
+        if (-not $failed -or $writes.Count) { throw 'A missing runtime executable was accepted.' }
+
+        $env:NVM_SYMLINK = $preferred
+        if ((Get-NvmRuntimeDirectory -NvmVersion ([version]'1.2.0') -LogDirectory temp) -cne $preferred) {
+            throw 'NVM 1 runtime directory was not found from NVM_SYMLINK.'
+        }
+        function Invoke-ToolCommand { return ('{"root":"' + ($fixture -replace '\\', '\\') + '/nvm"}') }
+        $legacyRuntime = Join-Path $fixture '.nodejs'
+        $null = [IO.Directory]::CreateDirectory($legacyRuntime)
+        [IO.File]::WriteAllText((Join-Path $legacyRuntime 'node.exe'), '')
+        $env:LOCALAPPDATA = $fixture
+        if ((Get-NvmRuntimeDirectory -NvmVersion ([version]'2.0.0') -LogDirectory temp) -cne (Join-Path $fixture '.nodejs')) {
+            throw 'NVM 2 runtime directory was not derived from its root.'
+        }
+        $userRuntime = Join-Path $fixture 'Author Software/nvm/.nodejs'
+        $null = [IO.Directory]::CreateDirectory($userRuntime)
+        [IO.File]::WriteAllText((Join-Path $userRuntime 'node.exe'), '')
+        $env:Path = $userRuntime
+        if ((Get-NvmRuntimeDirectory -NvmVersion ([version]'2.0.0') -LogDirectory temp) -cne $userRuntime) {
+            throw 'The nvm runtime on PATH was not selected when multiple candidates exist.'
+        }
+        $env:Path = "$legacyRuntime;$userRuntime"
+        $failed = $false
+        try { Get-NvmRuntimeDirectory -NvmVersion ([version]'2.0.0') -LogDirectory temp | Out-Null }
+        catch { $failed = $_.Exception.Message -match 'PATH ambiguity' }
+        if (-not $failed) { throw 'Ambiguous nvm runtime directories were accepted.' }
+        $env:Path = $originalPath
+        $script:CommandFixture = [pscustomobject]@{ CommandType = 'Application'; Source = (Join-Path $preferred 'python.exe') }
+        function Get-Command { return $script:CommandFixture }
+        Assert-RuntimeCommand -Name python -ExpectedPath (Join-Path $preferred 'python.exe')
+        $script:CommandFixture = [pscustomobject]@{ CommandType = 'Function'; Source = 'python' }
+        $failed = $false
+        try { Assert-RuntimeCommand -Name python -ExpectedPath (Join-Path $preferred 'python.exe') }
+        catch { $failed = $_.Exception.Message -match 'aliases, functions, and PATH' }
+        if (-not $failed) { throw 'A PowerShell function shadowing the runtime was accepted.' }
+
+        $npmPath = Join-Path $preferred 'npm.ps1'
+        [IO.File]::WriteAllText($npmPath, "Write-Output '1.2.3'; `$global:LASTEXITCODE = 0")
+        function Get-NvmVersion { return '2.0.0' }
+        function Get-NvmRuntimeDirectory { return $preferred }
+        function Invoke-ToolCommand { return $preferred }
+        function Get-Command {
+            param($Name)
+            if ($Name -eq 'npm') { return [pscustomobject]@{ CommandType = 'ExternalScript'; Source = $npmPath } }
+            return [pscustomobject]@{ CommandType = 'Application'; Source = (Join-Path $preferred "$Name.exe") }
+        }
+        Test-RuntimeCommands -LogDirectory temp
+        $npmPath = Join-Path $other 'npm.ps1'
+        $failed = $false
+        try { Test-RuntimeCommands -LogDirectory temp }
+        catch { $failed = $_.Exception.Message -match 'npm does not resolve' }
+        if (-not $failed) { throw 'An npm command outside the nvm runtime was accepted.' }
+    }
+    finally {
+        $env:AGENTBOX_PATH_FIXTURE = $originalFixtureEnv
+        $env:NVM_SYMLINK = $originalNvmSymlink
+        $env:LOCALAPPDATA = $originalLocalAppData
+        $env:Path = $originalPath
+        if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $fixture) {
+            Remove-Item -LiteralPath $fixture -Recurse -Force
+        }
+    }
 }
 
 & {

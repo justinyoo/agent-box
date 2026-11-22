@@ -224,6 +224,100 @@ function Update-ProcessPath {
     $env:Path = [Environment]::ExpandEnvironmentVariables($path)
 }
 
+function Get-PersistentRuntimePath {
+    param([ValidateSet('User', 'Machine')][string]$Scope)
+
+    $root = if ($Scope -eq 'User') { [Microsoft.Win32.Registry]::CurrentUser } else { [Microsoft.Win32.Registry]::LocalMachine }
+    $subkey = if ($Scope -eq 'User') { 'Environment' } else { 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment' }
+    $key = $root.OpenSubKey($subkey, $false)
+    if ($null -eq $key) { throw "Cannot open the $Scope environment registry key." }
+    try {
+        return [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    }
+    finally { $key.Dispose() }
+}
+
+function Set-PersistentRuntimePath {
+    param([ValidateSet('User', 'Machine')][string]$Scope, [string]$Value)
+
+    $root = if ($Scope -eq 'User') { [Microsoft.Win32.Registry]::CurrentUser } else { [Microsoft.Win32.Registry]::LocalMachine }
+    $subkey = if ($Scope -eq 'User') { 'Environment' } else { 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment' }
+    $key = $root.OpenSubKey($subkey, $true)
+    if ($null -eq $key) { throw "Cannot write the $Scope environment registry key." }
+    try {
+        $existing = $key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $kind = if ($null -eq $existing) { [Microsoft.Win32.RegistryValueKind]::ExpandString } else { $key.GetValueKind('Path') }
+        if ($kind -notin @([Microsoft.Win32.RegistryValueKind]::String, [Microsoft.Win32.RegistryValueKind]::ExpandString)) {
+            throw "The $Scope PATH has an unsupported registry type."
+        }
+        $key.SetValue('Path', $Value, $kind)
+    }
+    finally { $key.Dispose() }
+
+    if (-not ('AgentBox.EnvironmentNotifier' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace AgentBox {
+    public static class EnvironmentNotifier {
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr wParam,
+            string lParam, uint flags, uint timeout, out UIntPtr result);
+    }
+}
+'@ -ErrorAction Stop
+    }
+    $result = [UIntPtr]::Zero
+    $sent = [AgentBox.EnvironmentNotifier]::SendMessageTimeout(
+        [IntPtr]0xffff, 0x1a, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result
+    )
+    if ($sent -eq [IntPtr]::Zero) { throw "Updated $Scope PATH, but could not broadcast the environment change. Sign out and sign in again." }
+}
+
+function Get-PrioritizedRuntimePath {
+    param([string]$PathValue, [string]$Directory)
+
+    $target = [Environment]::ExpandEnvironmentVariables($Directory).TrimEnd('\', '/')
+    $entries = @($PathValue -split ';' | Where-Object {
+        [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"')).TrimEnd('\', '/') -ine $target
+    })
+    if ([string]::IsNullOrEmpty($PathValue)) { return $Directory }
+    return (@($Directory) + $entries) -join ';'
+}
+
+function Set-RuntimePathPriority {
+    param([string]$Directory, [string]$Executable)
+
+    if (-not [IO.Path]::IsPathRooted($Directory) -or $Directory -match '[;"]' -or
+        -not (Test-Path -LiteralPath (Join-Path $Directory $Executable) -PathType Leaf)) {
+        throw "The runtime executable directory is invalid: $Directory"
+    }
+    $userPath = Get-PersistentRuntimePath -Scope User
+    $machinePath = Get-PersistentRuntimePath -Scope Machine
+    $userUpdated = Get-PrioritizedRuntimePath -PathValue $userPath -Directory $Directory
+    $machineNeedsPriority = $false
+    $target = [Environment]::ExpandEnvironmentVariables($Directory).TrimEnd('\', '/')
+    foreach ($entry in ($machinePath -split ';')) {
+        $expanded = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"'))
+        if ($expanded.TrimEnd('\', '/') -ieq $target) { break }
+        if ($expanded -and [IO.Path]::IsPathRooted($expanded) -and
+            (Test-Path -LiteralPath (Join-Path $expanded $Executable) -PathType Leaf)) {
+            $machineNeedsPriority = $true
+            break
+        }
+    }
+    if ($machineNeedsPriority) {
+        if (-not (Confirm-InstallAction "Prioritize $Directory in the system PATH for $Executable. This affects all users.")) {
+            throw "System PATH priority for $Executable was declined."
+        }
+        $machineUpdated = Get-PrioritizedRuntimePath -PathValue $machinePath -Directory $Directory
+        if ($machineUpdated -cne $machinePath) { Set-PersistentRuntimePath -Scope Machine -Value $machineUpdated }
+        Write-InstallMessage "[WARN] System PATH now prioritizes $Directory for all users; other users may not have access to this directory."
+    }
+    if ($userUpdated -cne $userPath) { Set-PersistentRuntimePath -Scope User -Value $userUpdated }
+    Update-ProcessPath
+}
+
 function Initialize-WinGet {
     param([string]$LogDirectory)
 
@@ -719,6 +813,54 @@ function Get-LatestNodeLts {
     }
 }
 
+function Get-NvmRuntimeDirectory {
+    param([version]$NvmVersion, [string]$LogDirectory)
+
+    if ($NvmVersion.Major -lt 2) {
+        if ([string]::IsNullOrWhiteSpace($env:NVM_SYMLINK)) {
+            throw 'NVM_SYMLINK is not set. Check the nvm-windows installation.'
+        }
+        return $env:NVM_SYMLINK
+    }
+    $json = Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments @(
+        'config', 'get', 'root', 'mode', '--json'
+    ) -LogDirectory $LogDirectory
+    $config = $json | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $config -or -not $config.PSObject.Properties['root'] -or
+        $config.root -isnot [string] -or -not [IO.Path]::IsPathRooted($config.root)) {
+        throw 'Could not determine the nvm-windows runtime directory.'
+    }
+    $parent = Split-Path $config.root.TrimEnd('\', '/') -Parent
+    if (-not $parent) { throw 'Could not determine the nvm-windows runtime directory.' }
+    $candidates = @((Join-Path $parent '.nodejs'))
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $candidates += Join-Path $env:LOCALAPPDATA 'Author Software\nvm\.nodejs'
+    }
+    $existing = @($candidates | Select-Object -Unique | Where-Object {
+        Test-Path -LiteralPath (Join-Path $_ 'node.exe') -PathType Leaf
+    })
+    if ($existing.Count -eq 1) { return $existing[0] }
+    if ($existing.Count -gt 1) {
+        $pathEntries = @($env:Path -split ';' | ForEach-Object {
+            [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"')).TrimEnd('\', '/')
+        })
+        $active = @($existing | Where-Object { $pathEntries -icontains $_.TrimEnd('\', '/') })
+        if ($active.Count -eq 1) { return $active[0] }
+        throw 'Multiple nvm-windows runtime directories were found. Resolve the PATH ambiguity before continuing.'
+    }
+    throw 'The nvm-windows runtime directory does not contain node.exe.'
+}
+
+function Assert-RuntimeCommand {
+    param([string]$Name, [string]$ExpectedPath)
+
+    $command = Get-Command $Name -ErrorAction Stop | Select-Object -First 1
+    if ($command.CommandType -ne 'Application' -or
+        [IO.Path]::GetFullPath($command.Source) -ine [IO.Path]::GetFullPath($ExpectedPath)) {
+        throw "$Name does not resolve to $ExpectedPath. Check PowerShell aliases, functions, and PATH."
+    }
+}
+
 function Install-NodeRuntime {
     param([string]$LogDirectory)
 
@@ -739,6 +881,9 @@ function Install-NodeRuntime {
     Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments (@('use') + $nodeArguments) `
         -LogDirectory $LogDirectory | Out-Null
     Update-ProcessPath
+    $runtimeDirectory = Get-NvmRuntimeDirectory -NvmVersion $nvmVersion -LogDirectory $LogDirectory
+    Set-RuntimePathPriority -Directory $runtimeDirectory -Executable 'node.exe'
+    Assert-RuntimeCommand -Name 'node' -ExpectedPath (Join-Path $runtimeDirectory 'node.exe')
     $nodeJson = Invoke-ToolCommand -CommandName 'node.exe' -Arguments @(
         '-p', 'JSON.stringify({version:process.versions.node,lts:process.release.lts,arch:process.arch})'
     ) -LogDirectory $LogDirectory
@@ -772,11 +917,14 @@ function Install-PythonRuntime {
     }
     Write-InstallMessage "[INFO] Installing the latest Python $PythonVersion patch available to uv."
     Invoke-ToolCommand -CommandName 'uv.exe' -Arguments @(
-        'python', 'install', $PythonVersion, '--upgrade', '--no-config', '--no-progress'
+        'python', 'install', $PythonVersion, '--upgrade', '--default', '--no-config', '--no-progress'
     ) -LogDirectory $LogDirectory | Out-Null
     $pythonPath = Invoke-ToolCommand -CommandName 'uv.exe' -Arguments @(
         'python', 'find', "cpython$PythonVersion", '--managed-python', '--no-python-downloads',
         '--no-project', '--system', '--no-config'
+    ) -LogDirectory $LogDirectory
+    $binDirectory = Invoke-ToolCommand -CommandName 'uv.exe' -Arguments @(
+        'python', 'dir', '--bin', '--no-config'
     ) -LogDirectory $LogDirectory
     if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
         throw 'uv did not return an existing managed Python executable.'
@@ -786,8 +934,44 @@ function Install-PythonRuntime {
     if ($pythonOutput -notmatch ('^Python ' + [regex]::Escape($PythonVersion) + '\.\d+$')) {
         throw "The uv-managed interpreter does not report a stable Python $PythonVersion patch."
     }
-    Write-InstallMessage "[PASS] $pythonOutput is available through uv. Existing unversioned Python commands were not replaced."
+    $defaultPython = Join-Path $binDirectory 'python.exe'
+    if (-not (Test-Path -LiteralPath $defaultPython -PathType Leaf)) {
+        throw "uv did not create $defaultPython. Check for an existing executable in the uv bin directory."
+    }
+    $identityCode = "print(__import__('os').path.realpath(__import__('sys').executable))"
+    $managedIdentity = Invoke-ToolCommand -CommandName $pythonPath -Arguments @('-c', $identityCode) -LogDirectory $LogDirectory
+    $defaultIdentity = Invoke-ToolCommand -CommandName $defaultPython -Arguments @('-c', $identityCode) -LogDirectory $LogDirectory
+    if ([string]::IsNullOrWhiteSpace($managedIdentity) -or $managedIdentity -ine $defaultIdentity) {
+        throw "The Python executable in $binDirectory is not the selected uv-managed interpreter; existing files were not overwritten."
+    }
+    Set-RuntimePathPriority -Directory $binDirectory -Executable 'python.exe'
+    Assert-RuntimeCommand -Name 'python' -ExpectedPath $defaultPython
+    Write-InstallMessage "[PASS] $pythonOutput is the default Python command for the signed-in user."
     return $true
+}
+
+function Test-RuntimeCommands {
+    param([string]$LogDirectory)
+
+    $nvmVersion = [version]((Get-NvmVersion -LogDirectory $LogDirectory).Split('-')[0])
+    $nodeDirectory = Get-NvmRuntimeDirectory -NvmVersion $nvmVersion -LogDirectory $LogDirectory
+    $pythonDirectory = Invoke-ToolCommand -CommandName 'uv.exe' -Arguments @(
+        'python', 'dir', '--bin', '--no-config'
+    ) -LogDirectory $LogDirectory
+    Assert-RuntimeCommand -Name 'node' -ExpectedPath (Join-Path $nodeDirectory 'node.exe')
+    Assert-RuntimeCommand -Name 'python' -ExpectedPath (Join-Path $pythonDirectory 'python.exe')
+
+    $npm = Get-Command npm -ErrorAction Stop | Select-Object -First 1
+    if ($npm.CommandType -notin @('Application', 'ExternalScript') -or
+        [IO.Path]::GetFullPath((Split-Path $npm.Source -Parent)) -ine [IO.Path]::GetFullPath($nodeDirectory) -or
+        (Split-Path $npm.Source -Leaf) -notin @('npm.exe', 'npm.cmd', 'npm.ps1')) {
+        throw 'npm does not resolve to the nvm runtime directory. Check PowerShell aliases, functions, and PATH.'
+    }
+    $global:LASTEXITCODE = $null
+    $npmVersion = (& $npm.Source --version | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $npmVersion -notmatch '^\d+\.\d+\.\d+') {
+        throw 'The default npm command could not be verified.'
+    }
 }
 
 # Installer context and stages.
@@ -882,6 +1066,7 @@ function Invoke-VmToolInstallation {
 
     try {
         Test-DevToolCommands -LogDirectory $LogDirectory
+        if ($complete) { Test-RuntimeCommands -LogDirectory $LogDirectory }
     }
     catch {
         Write-InstallMessage "[FAIL] Tool verification is incomplete: $($_.Exception.Message)"
