@@ -5,8 +5,8 @@
 Installs Agent Box tools in interactive groups after per-item confirmation.
 .DESCRIPTION
 Run in an elevated Windows x64 user session, not as SYSTEM. Windows PowerShell
-5.1 is supported so that PowerShell 7 does not need to be installed beforehand.
-If necessary, bootstraps WinGet using Microsoft's Microsoft.WinGet.Client module.
+5.1 bootstraps WinGet and PowerShell 7 when necessary, then runs the remaining
+installation in PowerShell 7.
 
 The installer preserves existing tools, asks before each installation, and stops
 for manual restarts. -Yes approves the listed package agreements and actions.
@@ -206,22 +206,90 @@ function Invoke-ToolCommand {
     return ([string]$result.StandardOutput).Trim()
 }
 
-function Update-ProcessPath {
-    # NVM's PATH entries can reference variables installed after this process started.
-    foreach ($name in @('NVM_HOME', 'NVM_SYMLINK')) {
-        $value = [Environment]::GetEnvironmentVariable($name, 'User')
-        if ([string]::IsNullOrEmpty($value)) {
-            $value = [Environment]::GetEnvironmentVariable($name, 'Machine')
-        }
-        if (-not [string]::IsNullOrEmpty($value)) {
-            [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+function Find-AgentPowerShell {
+    $candidates = @(
+        Get-Command pwsh -CommandType Application -All -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.Source }
+    )
+    foreach ($base in @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($base) { $candidates += Join-Path $base 'PowerShell\7\pwsh.exe' }
+    }
+    if ($env:LOCALAPPDATA) {
+        $candidates += Join-Path $env:LOCALAPPDATA 'Microsoft\PowerShell\7\pwsh.exe'
+    }
+    foreach ($scope in @('Machine', 'User')) {
+        foreach ($directory in ([Environment]::GetEnvironmentVariable('Path', $scope) -split ';')) {
+            if ($directory) {
+                $candidates += Join-Path ([Environment]::ExpandEnvironmentVariables($directory.Trim().Trim('"'))) 'pwsh.exe'
+            }
         }
     }
-    $path = @(
-        [Environment]::GetEnvironmentVariable('Path', 'Machine')
-        [Environment]::GetEnvironmentVariable('Path', 'User')
-    ) -join [IO.Path]::PathSeparator
-    $env:Path = [Environment]::ExpandEnvironmentVariables($path)
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        try {
+            $major = & $candidate -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.Major' 2>$null
+            if ($LASTEXITCODE -eq 0 -and "$major".Trim() -eq '7') { return $candidate }
+        }
+        catch { Write-InstallMessage "[WARN] Could not inspect PowerShell at $candidate`: $($_.Exception.Message)" }
+    }
+}
+
+function Invoke-AgentPowerShell {
+    param([string]$ScriptPath, [System.Collections.IDictionary]$BoundParameters)
+
+    $executable = Find-AgentPowerShell
+    if (-not $executable) { throw 'PowerShell 7.x could not be located. Open a new terminal and retry.' }
+    $parameters = @{}
+    foreach ($key in $BoundParameters.Keys) {
+        $value = $BoundParameters[$key]
+        if ($value -is [Management.Automation.SwitchParameter]) { $value = [bool]$value }
+        $parameters[$key] = $value
+    }
+    $payload = [Management.Automation.PSSerializer]::Serialize(@{ Path = $ScriptPath; Parameters = $parameters })
+    $data = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
+    $command = @'
+$payload = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('__DATA__')))
+$parameters = $payload.Parameters
+$global:LASTEXITCODE = 0
+& $payload.Path @parameters
+$succeeded = $?
+if ($succeeded) { exit 0 }
+if ($LASTEXITCODE -eq 0) { exit 1 }
+exit $LASTEXITCODE
+'@
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command.Replace('__DATA__', $data)))
+    $workerArguments = @('-NoLogo', '-NoProfile', '-InputFormat', 'Text', '-OutputFormat', 'Text')
+    $interactive = Test-InstallInteractive
+    if (-not $interactive) { $workerArguments += '-NonInteractive' }
+    $workerArguments += @('-EncodedCommand', $encoded)
+    if ($interactive) {
+        $worker = Start-Process -FilePath $executable -ArgumentList $workerArguments -NoNewWindow -Wait -PassThru -ErrorAction Stop
+        return $worker.ExitCode
+    }
+    & $executable @workerArguments | Out-Host
+    return $LASTEXITCODE
+}
+
+function Update-ProcessPath {
+    foreach ($name in @('NVM_HOME', 'NVM_SYMLINK')) {
+        if (-not [Environment]::GetEnvironmentVariable($name, 'Process')) {
+            foreach ($scope in @('User', 'Machine')) {
+                $value = [Environment]::GetEnvironmentVariable($name, $scope)
+                if ($value) {
+                    [Environment]::SetEnvironmentVariable($name, [Environment]::ExpandEnvironmentVariables($value), 'Process')
+                    break
+                }
+            }
+        }
+        $existing = @($env:Path -split ';' | Where-Object { $_ })
+        foreach ($scope in @('Machine', 'User')) {
+            foreach ($entry in ([Environment]::GetEnvironmentVariable('Path', $scope) -split ';')) {
+                $expanded = [Environment]::ExpandEnvironmentVariables($entry.Trim())
+                if ($expanded -and $expanded -notin $existing) { $existing += $expanded }
+            }
+        }
+        $env:Path = $existing -join ';'
+    }
 }
 
 function Get-PersistentRuntimePath {
@@ -238,11 +306,9 @@ function Get-PersistentRuntimePath {
 }
 
 function Set-PersistentRuntimePath {
-    param([ValidateSet('User', 'Machine')][string]$Scope, [string]$Value)
+    param([ValidateSet('User')][string]$Scope, [string]$Value)
 
-    $root = if ($Scope -eq 'User') { [Microsoft.Win32.Registry]::CurrentUser } else { [Microsoft.Win32.Registry]::LocalMachine }
-    $subkey = if ($Scope -eq 'User') { 'Environment' } else { 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment' }
-    $key = $root.OpenSubKey($subkey, $true)
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
     if ($null -eq $key) { throw "Cannot write the $Scope environment registry key." }
     try {
         $existing = $key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
@@ -274,47 +340,51 @@ namespace AgentBox {
     if ($sent -eq [IntPtr]::Zero) { throw "Updated $Scope PATH, but could not broadcast the environment change. Sign out and sign in again." }
 }
 
-function Get-PrioritizedRuntimePath {
-    param([string]$PathValue, [string]$Directory)
+function Assert-NoRuntimeCommandConflict {
+    param([string]$Name, [string]$ExpectedPath)
 
-    $target = [Environment]::ExpandEnvironmentVariables($Directory).TrimEnd('\', '/')
-    $entries = @($PathValue -split ';' | Where-Object {
-        [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"')).TrimEnd('\', '/') -ine $target
-    })
-    if ([string]::IsNullOrEmpty($PathValue)) { return $Directory }
-    return (@($Directory) + $entries) -join ';'
+    $command = Get-Command $Name -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command -and ($command.CommandType -ne 'Application' -or
+        [IO.Path]::GetFullPath($command.Source) -ine [IO.Path]::GetFullPath($ExpectedPath))) {
+        throw "The existing $Name command ($($command.Source)) takes precedence over $ExpectedPath. Resolve the conflict manually; PATH was not reordered."
+    }
 }
 
-function Set-RuntimePathPriority {
+function Test-RuntimePath {
     param([string]$Directory, [string]$Executable)
+
+    $machinePath = Get-PersistentRuntimePath -Scope Machine
+    $userPath = Get-PersistentRuntimePath -Scope User
+    $target = [Environment]::ExpandEnvironmentVariables($Directory).TrimEnd('\', '/')
+    foreach ($entry in ((@($machinePath, $userPath) -join ';') -split ';')) {
+        $expanded = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"'))
+        if ($expanded.TrimEnd('\', '/') -ieq $target) { return $true }
+        if ($expanded -and [IO.Path]::IsPathRooted($expanded) -and
+            (Test-Path -LiteralPath (Join-Path $expanded $Executable) -PathType Leaf)) {
+            throw "An existing $Executable in $expanded takes precedence over $Directory. Resolve the PATH conflict manually; existing entries were preserved."
+        }
+    }
+    return $false
+}
+
+function Set-RuntimePath {
+    param([string]$Directory, [string]$Executable, [string]$Name)
 
     if (-not [IO.Path]::IsPathRooted($Directory) -or $Directory -match '[;"]' -or
         -not (Test-Path -LiteralPath (Join-Path $Directory $Executable) -PathType Leaf)) {
         throw "The runtime executable directory is invalid: $Directory"
     }
-    $userPath = Get-PersistentRuntimePath -Scope User
-    $machinePath = Get-PersistentRuntimePath -Scope Machine
-    $userUpdated = Get-PrioritizedRuntimePath -PathValue $userPath -Directory $Directory
-    $machineNeedsPriority = $false
-    $target = [Environment]::ExpandEnvironmentVariables($Directory).TrimEnd('\', '/')
-    foreach ($entry in ($machinePath -split ';')) {
-        $expanded = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"'))
-        if ($expanded.TrimEnd('\', '/') -ieq $target) { break }
-        if ($expanded -and [IO.Path]::IsPathRooted($expanded) -and
-            (Test-Path -LiteralPath (Join-Path $expanded $Executable) -PathType Leaf)) {
-            $machineNeedsPriority = $true
-            break
+    Update-ProcessPath
+    Assert-NoRuntimeCommandConflict -Name $Name -ExpectedPath (Join-Path $Directory $Executable)
+    $found = Test-RuntimePath -Directory $Directory -Executable $Executable
+    if (-not $found) {
+        if (-not (Confirm-InstallAction "Append $Directory to the user PATH for $Executable, preserving existing entries and their order.")) {
+            throw "Adding $Directory to the user PATH was declined."
         }
+        $userPath = Get-PersistentRuntimePath -Scope User
+        $separator = if ($userPath -and -not $userPath.EndsWith(';')) { ';' } else { '' }
+        Set-PersistentRuntimePath -Scope User -Value "$userPath$separator$Directory"
     }
-    if ($machineNeedsPriority) {
-        if (-not (Confirm-InstallAction "Prioritize $Directory in the system PATH for $Executable. This affects all users.")) {
-            throw "System PATH priority for $Executable was declined."
-        }
-        $machineUpdated = Get-PrioritizedRuntimePath -PathValue $machinePath -Directory $Directory
-        if ($machineUpdated -cne $machinePath) { Set-PersistentRuntimePath -Scope Machine -Value $machineUpdated }
-        Write-InstallMessage "[WARN] System PATH now prioritizes $Directory for all users; other users may not have access to this directory."
-    }
-    if ($userUpdated -cne $userPath) { Set-PersistentRuntimePath -Scope User -Value $userUpdated }
     Update-ProcessPath
 }
 
@@ -370,6 +440,21 @@ function Initialize-WinGet {
     return $command.Source
 }
 
+function Get-LatestPowerShell7Version {
+    param([string]$WinGetExecutable, [string]$LogDirectory)
+
+    $arguments = @('show', '--id', 'Microsoft.PowerShell', '--exact', '--source', 'winget', '--versions', '--disable-interactivity')
+    if ($Yes) { $arguments += '--accept-source-agreements' }
+    $result = Invoke-LoggedProcess -Executable $WinGetExecutable -Arguments $arguments -LogDirectory $LogDirectory
+    if ($result.ExitCode -ne 0) { throw "Could not query PowerShell versions. See $LogDirectory." }
+    $versions = @(([string]$result.StandardOutput -split '\r?\n') |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -match '^7\.\d+\.\d+(?:\.\d+)?$' } |
+        ForEach-Object { [version]$_ } | Sort-Object -Descending)
+    if (-not $versions.Count) { throw 'WinGet did not return a stable PowerShell 7.x version.' }
+    return $versions[0].ToString()
+}
+
 function Install-DevToolPackages {
     param(
         [string]$WinGetExecutable,
@@ -395,8 +480,9 @@ function Install-DevToolPackages {
     $notInstalled = [Convert]::ToUInt32('8A150014', 16)
     $alreadyInstalled = @('8A15002B', '8A150061', '8A15010D') |
         ForEach-Object { [Convert]::ToUInt32($_, 16) }
-    $rebootRequired = @('8A150109', '8A15010A') |
-        ForEach-Object { [Convert]::ToUInt32($_, 16) }
+    $rebootRequired = @([uint32]1641, [uint32]3010) + @(
+        '8A150109', '8A15010A' | ForEach-Object { [Convert]::ToUInt32($_, 16) }
+    )
 
     $complete = $true
     foreach ($package in $packages) {
@@ -431,6 +517,9 @@ function Install-DevToolPackages {
             '--architecture', 'x64', '--silent', '--no-upgrade',
             '--accept-source-agreements', '--accept-package-agreements', '--disable-interactivity'
         )
+        if ($id -eq 'Microsoft.PowerShell') {
+            $arguments += @('--version', (Get-LatestPowerShell7Version -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory))
+        }
         $arguments += $package.Extra
 
         $code = Invoke-WinGetCommand -Executable $WinGetExecutable -Arguments $arguments `
@@ -452,6 +541,22 @@ function Install-DevToolPackages {
         Write-InstallMessage "[PASS] Verified the $($package.Name) installation."
     }
     return $complete
+}
+
+function Initialize-AgentPowerShell {
+    param([string]$WinGetExecutable, [string]$LogDirectory)
+
+    if (Find-AgentPowerShell) {
+        Write-InstallMessage '[PASS] PowerShell 7.x is installed. Keeping the existing installation.'
+        return $true
+    }
+    if (-not (Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Prerequisites)) {
+        return $false
+    }
+    if (-not (Find-AgentPowerShell)) {
+        throw 'PowerShell 7.x could not be verified after installation. Open a new terminal and rerun.'
+    }
+    return $true
 }
 
 function Get-NvmVersion {
@@ -513,6 +618,11 @@ function Install-NvmForWindows {
         $version = Get-NvmVersion -LogDirectory $LogDirectory
         Write-InstallMessage "[PASS] NVM $version is installed. Keeping the existing installation."
         return $true
+    }
+    $defaultLink = if ($env:ProgramFiles) { Join-Path $env:ProgramFiles 'nodejs' }
+    if ((Get-Command node -ErrorAction SilentlyContinue) -or $env:NVM_HOME -or $env:NVM_SYMLINK -or
+        ($defaultLink -and (Test-Path -LiteralPath $defaultLink))) {
+        throw 'Existing Node.js or nvm paths were found without a usable nvm command. Preserve them and resolve the conflict manually before installing nvm.'
     }
     if (-not (Confirm-InstallAction 'Install nvm-windows from its latest stable GitHub x64 release.')) {
         return $false
@@ -762,8 +872,10 @@ function Test-DevToolCommands {
     param([string]$LogDirectory)
 
     Update-ProcessPath
+    $powerShell = Find-AgentPowerShell
+    if (-not $powerShell) { throw 'PowerShell 7.x could not be located.' }
     $checks = @(
-        @{ Command = 'pwsh.exe'; Arguments = @('--version') }
+        @{ Command = $powerShell; Arguments = @('--version') }
         @{ Command = 'dotnet.exe'; Arguments = @('--list-sdks') }
         @{ Command = 'git.exe'; Arguments = @('--version') }
         @{ Command = 'nvm.exe'; Arguments = @('version') }
@@ -848,7 +960,7 @@ function Get-NvmRuntimeDirectory {
         if ($active.Count -eq 1) { return $active[0] }
         throw 'Multiple nvm-windows runtime directories were found. Resolve the PATH ambiguity before continuing.'
     }
-    throw 'The nvm-windows runtime directory does not contain node.exe.'
+    throw 'The nvm-windows runtime directory does not contain node.exe. Resolve any existing Node.js or nvm path conflict manually.'
 }
 
 function Assert-RuntimeCommand {
@@ -870,6 +982,16 @@ function Install-NodeRuntime {
         return $false
     }
     $nvmVersion = [version]((Get-NvmVersion -LogDirectory $LogDirectory).Split('-')[0])
+    Update-ProcessPath
+    $currentNode = Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($currentNode) {
+        if ($currentNode.CommandType -ne 'Application') {
+            throw 'The existing node command is not an nvm executable. Resolve the conflict manually.'
+        }
+        $existingRuntime = Get-NvmRuntimeDirectory -NvmVersion $nvmVersion -LogDirectory $LogDirectory
+        Assert-NoRuntimeCommandConflict -Name 'node' -ExpectedPath (Join-Path $existingRuntime 'node.exe')
+        $null = Test-RuntimePath -Directory $existingRuntime -Executable 'node.exe'
+    }
     $nodeArguments = @($node.Version)
     if ($nvmVersion.Major -lt 2) {
         $nodeArguments += '64'
@@ -878,11 +1000,15 @@ function Install-NodeRuntime {
     Write-InstallMessage "[INFO] Installing and activating Node.js LTS $($node.Version) ($($node.Lts))."
     Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments (@('install') + $nodeArguments) `
         -LogDirectory $LogDirectory | Out-Null
+    Update-ProcessPath
+    $runtimeDirectory = Get-NvmRuntimeDirectory -NvmVersion $nvmVersion -LogDirectory $LogDirectory
+    Assert-NoRuntimeCommandConflict -Name 'node' -ExpectedPath (Join-Path $runtimeDirectory 'node.exe')
+    $null = Test-RuntimePath -Directory $runtimeDirectory -Executable 'node.exe'
     Invoke-ToolCommand -CommandName 'nvm.exe' -Arguments (@('use') + $nodeArguments) `
         -LogDirectory $LogDirectory | Out-Null
     Update-ProcessPath
     $runtimeDirectory = Get-NvmRuntimeDirectory -NvmVersion $nvmVersion -LogDirectory $LogDirectory
-    Set-RuntimePathPriority -Directory $runtimeDirectory -Executable 'node.exe'
+    Set-RuntimePath -Directory $runtimeDirectory -Executable 'node.exe' -Name 'node'
     Assert-RuntimeCommand -Name 'node' -ExpectedPath (Join-Path $runtimeDirectory 'node.exe')
     $nodeJson = Invoke-ToolCommand -CommandName 'node.exe' -Arguments @(
         '-p', 'JSON.stringify({version:process.versions.node,lts:process.release.lts,arch:process.arch})'
@@ -917,7 +1043,7 @@ function Install-PythonRuntime {
     }
     Write-InstallMessage "[INFO] Installing the latest Python $PythonVersion patch available to uv."
     Invoke-ToolCommand -CommandName 'uv.exe' -Arguments @(
-        'python', 'install', $PythonVersion, '--upgrade', '--default', '--no-config', '--no-progress'
+        'python', 'install', $PythonVersion, '--upgrade', '--no-config', '--no-progress'
     ) -LogDirectory $LogDirectory | Out-Null
     $pythonPath = Invoke-ToolCommand -CommandName 'uv.exe' -Arguments @(
         'python', 'find', "cpython$PythonVersion", '--managed-python', '--no-python-downloads',
@@ -934,17 +1060,33 @@ function Install-PythonRuntime {
     if ($pythonOutput -notmatch ('^Python ' + [regex]::Escape($PythonVersion) + '\.\d+$')) {
         throw "The uv-managed interpreter does not report a stable Python $PythonVersion patch."
     }
+    if (-not [IO.Path]::IsPathRooted($binDirectory) -or $binDirectory -match '[;"]') {
+        throw 'uv did not return a valid Python executable directory.'
+    }
     $defaultPython = Join-Path $binDirectory 'python.exe'
+    Update-ProcessPath
+    Assert-NoRuntimeCommandConflict -Name 'python' -ExpectedPath $defaultPython
+    $null = Test-RuntimePath -Directory $binDirectory -Executable 'python.exe'
+    $identityCode = "print(__import__('os').path.realpath(__import__('sys').executable))"
+    $managedIdentity = Invoke-ToolCommand -CommandName $pythonPath -Arguments @('-c', $identityCode) -LogDirectory $LogDirectory
+    if ([string]::IsNullOrWhiteSpace($managedIdentity)) { throw 'Could not verify the uv-managed Python executable.' }
+    if (Test-Path -LiteralPath $defaultPython -PathType Leaf) {
+        $defaultIdentity = Invoke-ToolCommand -CommandName $defaultPython -Arguments @('-c', $identityCode) -LogDirectory $LogDirectory
+        if ($managedIdentity -ine $defaultIdentity) {
+            throw "The existing Python executable in $binDirectory is not the selected uv-managed interpreter. Resolve the conflict manually; it was not overwritten."
+        }
+    }
+    Invoke-ToolCommand -CommandName 'uv.exe' -Arguments @(
+        'python', 'install', $PythonVersion, '--default', '--no-config', '--no-progress'
+    ) -LogDirectory $LogDirectory | Out-Null
     if (-not (Test-Path -LiteralPath $defaultPython -PathType Leaf)) {
         throw "uv did not create $defaultPython. Check for an existing executable in the uv bin directory."
     }
-    $identityCode = "print(__import__('os').path.realpath(__import__('sys').executable))"
-    $managedIdentity = Invoke-ToolCommand -CommandName $pythonPath -Arguments @('-c', $identityCode) -LogDirectory $LogDirectory
     $defaultIdentity = Invoke-ToolCommand -CommandName $defaultPython -Arguments @('-c', $identityCode) -LogDirectory $LogDirectory
-    if ([string]::IsNullOrWhiteSpace($managedIdentity) -or $managedIdentity -ine $defaultIdentity) {
-        throw "The Python executable in $binDirectory is not the selected uv-managed interpreter; existing files were not overwritten."
+    if ($managedIdentity -ine $defaultIdentity) {
+        throw "The Python executable in $binDirectory is not the selected uv-managed interpreter. Resolve the conflict manually."
     }
-    Set-RuntimePathPriority -Directory $binDirectory -Executable 'python.exe'
+    Set-RuntimePath -Directory $binDirectory -Executable 'python.exe' -Name 'python'
     Assert-RuntimeCommand -Name 'python' -ExpectedPath $defaultPython
     Write-InstallMessage "[PASS] $pythonOutput is the default Python command for the signed-in user."
     return $true
@@ -998,18 +1140,11 @@ function Assert-VmInstallerContext {
 }
 
 function Invoke-VmToolInstallation {
-    param([string]$LogDirectory, [string]$PythonVersion)
+    param([string]$LogDirectory, [string]$PythonVersion, [string]$WinGetExecutable)
 
     $script:RestartRequired = $false
     $complete = $true
     Update-ProcessPath
-    Write-InstallMessage '[INFO] === [1/7] Installation prerequisites ==='
-    $wingetExecutable = Initialize-WinGet -LogDirectory $LogDirectory
-    if (-not (Install-DevToolPackages -WinGetExecutable $wingetExecutable -LogDirectory $LogDirectory -Group Prerequisites)) {
-        $complete = $false
-        if ($script:RestartRequired) { return 3010 }
-    }
-
     Write-InstallMessage '[INFO] === [2/7] Windows features ==='
     if (-not (Install-WslPlatform)) {
         $complete = $false
@@ -1027,7 +1162,7 @@ function Invoke-VmToolInstallation {
     }
 
     Write-InstallMessage '[INFO] === [3/7] Runtimes and SDKs ==='
-    if (-not (Install-DevToolPackages -WinGetExecutable $wingetExecutable -LogDirectory $LogDirectory -Group Runtimes)) {
+    if (-not (Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Runtimes)) {
         $complete = $false
         if ($script:RestartRequired) { return 3010 }
     }
@@ -1056,7 +1191,7 @@ function Invoke-VmToolInstallation {
         @{ Name = 'Editors'; Label = '[7/7] Editors and apps' }
     )) {
         Write-InstallMessage "[INFO] === $($group.Label) ==="
-        if (-not (Install-DevToolPackages -WinGetExecutable $wingetExecutable -LogDirectory $LogDirectory -Group $group.Name)) {
+        if (-not (Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group $group.Name)) {
             $complete = $false
             if ($script:RestartRequired) { return 3010 }
         }
@@ -1100,7 +1235,23 @@ try {
     Start-Transcript -Path (Join-Path $logDirectory 'install.log') -ErrorAction Stop | Out-Null
     $transcriptStarted = $true
     Write-InstallMessage "[INFO] Installation logs: $logDirectory"
-    exit (Invoke-VmToolInstallation -LogDirectory $logDirectory -PythonVersion $PythonVersion)
+    $script:RestartRequired = $false
+    if (Test-RebootPending) {
+        Write-InstallMessage '[MANUAL] A Windows restart is pending. Restart manually and rerun this script.'
+        exit 3010
+    }
+    Write-InstallMessage '[INFO] === [1/7] Installation prerequisites ==='
+    $wingetExecutable = Initialize-WinGet -LogDirectory $logDirectory
+    if (-not (Initialize-AgentPowerShell -WinGetExecutable $wingetExecutable -LogDirectory $logDirectory)) {
+        if ($script:RestartRequired) { exit 3010 }
+        exit 1
+    }
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        exit (Invoke-AgentPowerShell -ScriptPath $PSCommandPath `
+            -BoundParameters @{ PythonVersion = $PythonVersion; Yes = [bool]$Yes })
+    }
+    if ($PSVersionTable.PSVersion.Major -ne 7) { throw 'Run this script in PowerShell 7.x.' }
+    exit (Invoke-VmToolInstallation -LogDirectory $logDirectory -PythonVersion $PythonVersion -WinGetExecutable $wingetExecutable)
 }
 catch {
     Write-Error "[FAIL] $($_.Exception.Message)" -ErrorAction Continue

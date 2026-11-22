@@ -130,6 +130,89 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
 }
 
 & {
+    Set-StrictMode -Version Latest
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
+    foreach ($name in @('Initialize-AgentPowerShell', 'Invoke-AgentPowerShell', 'Get-LatestPowerShell7Version')) {
+        $definition = $ast.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+        }, $true)
+        if (-not $definition) { throw "Missing Agent Box PowerShell function: $name" }
+        Invoke-Expression $definition.Extent.Text
+    }
+    $script:PowerShellReady = $false
+    $script:PowerShellInstalls = 0
+    $script:PowerShellInstallResult = $true
+    function Find-AgentPowerShell {
+        if ($script:PowerShellReady) { return (Get-Process -Id $PID).Path }
+    }
+    function Install-DevToolPackages {
+        param($WinGetExecutable, $LogDirectory, $Group)
+        if ($Group -ne 'Prerequisites') { throw 'Unexpected bootstrap package group.' }
+        $script:PowerShellInstalls++
+        if (-not $script:PowerShellInstallResult) { return $false }
+        $script:PowerShellReady = $true
+        return $true
+    }
+    function Write-InstallMessage { }
+    function Test-InstallInteractive { return $false }
+    $Yes = $true
+    $script:PowerShellVersions = "8.0.0`n7.4.10`n7.5.2`n7.6.0-preview.1"
+    function Invoke-LoggedProcess {
+        return [pscustomobject]@{ ExitCode = 0; StandardOutput = $script:PowerShellVersions }
+    }
+    if ((Get-LatestPowerShell7Version -WinGetExecutable winget -LogDirectory temp) -ne '7.5.2') {
+        throw 'PowerShell bootstrap did not select the newest stable 7.x release.'
+    }
+    $script:PowerShellVersions = "8.0.0`n7.6.0-preview.1"
+    $failed = $false
+    try { Get-LatestPowerShell7Version -WinGetExecutable winget -LogDirectory temp | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'stable PowerShell 7.x version' }
+    if (-not $failed) { throw 'PowerShell bootstrap accepted a preview or a non-7.x version.' }
+    $script:PowerShellInstallResult = $false
+    if (Initialize-AgentPowerShell -WinGetExecutable winget -LogDirectory temp) {
+        throw 'A declined or restart-required PowerShell installation was reported as ready.'
+    }
+    $script:PowerShellInstallResult = $true
+    $script:PowerShellInstalls = 0
+    if (-not (Initialize-AgentPowerShell -WinGetExecutable winget -LogDirectory temp) -or
+        -not (Initialize-AgentPowerShell -WinGetExecutable winget -LogDirectory temp) -or
+        $script:PowerShellInstalls -ne 1) {
+        throw 'PowerShell bootstrap did not install once and preserve an existing installation.'
+    }
+    $temporary = Join-Path ([IO.Path]::GetTempPath()) ("agentbox-worker-test-" + [guid]::NewGuid().ToString('N'))
+    $worker = Join-Path $temporary 'worker with spaces.ps1'
+    $result = Join-Path $temporary 'result.json'
+    $previousOutput = $env:AGENTBOX_BOOTSTRAP_TEST_OUTPUT
+    try {
+        $null = New-Item -ItemType Directory -Path $temporary
+        [IO.File]::WriteAllText($worker, @'
+param([string]$PythonVersion, [switch]$Yes)
+@{ PythonVersion = $PythonVersion; Yes = [bool]$Yes } | ConvertTo-Json -Compress |
+    Set-Content -LiteralPath $env:AGENTBOX_BOOTSTRAP_TEST_OUTPUT
+exit 37
+'@)
+        $env:AGENTBOX_BOOTSTRAP_TEST_OUTPUT = $result
+        $code = Invoke-AgentPowerShell -ScriptPath $worker -BoundParameters @{ PythonVersion = '3.14'; Yes = $true }
+        $stored = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
+        if ($code -ne 37 -or $stored.PythonVersion -ne '3.14' -or -not $stored.Yes) {
+            throw 'Agent Box PowerShell bootstrap did not preserve parameters or the worker exit code.'
+        }
+        $code = Invoke-AgentPowerShell -ScriptPath $worker -BoundParameters @{ PythonVersion = '3.13'; Yes = $false }
+        $stored = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
+        if ($code -ne 37 -or $stored.PythonVersion -ne '3.13' -or $stored.Yes) {
+            throw 'Agent Box PowerShell bootstrap did not preserve a false consent switch.'
+        }
+    }
+    finally {
+        $env:AGENTBOX_BOOTSTRAP_TEST_OUTPUT = $previousOutput
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force }
+    }
+}
+
+& {
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
@@ -173,6 +256,7 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     $wslReady = $true
     $installation = [pscustomobject]@{ Enabled = $false; Installed = $false; Arguments = @() }
     function Test-WslPlatform { return $wslReady }
+    function Get-LatestPowerShell7Version { return '7.5.2' }
     function Invoke-WinGetCommand {
         param([string]$Executable, [string[]]$Arguments, [string]$LogDirectory)
         if ($installation.Enabled -and $Arguments[0] -eq 'install') {
@@ -219,6 +303,11 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
         $installation.Arguments -notcontains '--disable-interactivity') {
         throw 'WinGet installation did not preserve the approved package and agreement handling.'
     }
+    $installation.Installed = $false
+    if (-not (Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group Prerequisites) -or
+        $installation.Arguments -notcontains '--version' -or $installation.Arguments -notcontains '7.5.2') {
+        throw 'PowerShell bootstrap did not request the selected stable 7.x version.'
+    }
 }
 
 & {
@@ -242,7 +331,7 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     function Install-DevToolPackages {
         param([string]$WinGetExecutable, [string]$LogDirectory, [string]$Group)
         $events.Add("packages:$Group")
-        if ($Group -eq 'Prerequisites' -and $packageFailure) {
+        if ($Group -eq 'Runtimes' -and $packageFailure) {
             if ($packageFailure -eq 'restart') { $script:RestartRequired = $true }
             return $false
         }
@@ -266,11 +355,11 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     function Install-CopilotApp { $events.Add('copilot-app'); return $true }
     function Test-DevToolCommands { param([string]$LogDirectory) $events.Add('verification') }
     function Test-RuntimeCommands { param([string]$LogDirectory) $events.Add('runtime-verification') }
-    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 0) {
+    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14' -WinGetExecutable winget) -ne 0) {
         throw 'Agent Box installation did not report success.'
     }
     $expectedEvents = @(
-        'winget', 'packages:Prerequisites', 'wsl', 'ubuntu', 'packages:Runtimes',
+        'wsl', 'ubuntu', 'packages:Runtimes',
         'nvm', 'node', 'python:3.14', 'packages:Containers', 'packages:GitHub',
         'packages:Azure', 'packages:Editors', 'copilot-app', 'verification', 'runtime-verification'
     )
@@ -278,27 +367,27 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
         throw "Unexpected Agent Box installation order: $($events -join ',')."
     }
     $stages = @($messages | Where-Object { $_ -match '^\[INFO\] === \[\d/7\]' })
-    if ($stages.Count -ne 7) { throw 'Agent Box did not display all seven installation stages.' }
+    if ($stages.Count -ne 6) { throw 'Agent Box did not display the six post-bootstrap installation stages.' }
     for ($index = 0; $index -lt $stages.Count; $index++) {
-        if (-not $stages[$index].Contains("[$($index + 1)/7]")) {
+        if (-not $stages[$index].Contains("[$($index + 2)/7]")) {
             throw 'Agent Box installation stage numbers are out of order.'
         }
     }
     $events.Clear()
     $messages.Clear()
     $nodeFailure = $true
-    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 1 -or
+    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14' -WinGetExecutable winget) -ne 1 -or
         $events -notcontains 'python:3.14' -or
         -not ($messages | Where-Object { $_ -match '^\[FAIL\] Node\.js installation failed: fixture Node failure' })) {
         throw 'A Node.js failure prevented Python installation or was not reported.'
     }
     $nodeFailure = $false
     $packageFailure = 'restart'
-    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 3010) {
+    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14' -WinGetExecutable winget) -ne 3010) {
         throw 'Agent Box did not return the restart-required status.'
     }
     $packageFailure = 'incomplete'
-    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 1) {
+    if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14' -WinGetExecutable winget) -ne 1) {
         throw 'Agent Box did not return an incomplete-installation status.'
     }
 }
@@ -316,7 +405,13 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
         if (-not $definition) { throw "Missing Agent Box runtime function: $name" }
         Invoke-Expression $definition.Extent.Text
     }
-    function Get-Command { param($Name, $CommandType, $ErrorAction) return [pscustomobject]@{ Source = 'fixture.exe' } }
+    function Get-Command {
+        param($Name, $CommandType, $ErrorAction)
+        if ($Name -eq 'fixture.exe') { return [pscustomobject]@{ Source = 'fixture.exe' } }
+        if ($Name -eq 'node' -and ($script:ConflictName -eq 'node' -or $script:CurrentNode)) {
+            return [pscustomobject]@{ CommandType = 'Application'; Source = 'other-node.exe' }
+        }
+    }
     function Invoke-LoggedProcess {
         param($Executable, $Arguments, $LogDirectory)
         return [pscustomobject]@{ ExitCode = 0; StandardOutput = $null }
@@ -330,13 +425,25 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     $binDirectory = Split-Path $pythonPath -Parent
     $defaultPython = Join-Path $binDirectory 'python.exe'
     $script:DefaultIdentity = 'managed-python'
+    $script:ConflictName = ''
+    $script:CurrentNode = $false
+    $script:PersistentConflict = ''
     function Confirm-InstallAction { return $true }
     function Write-InstallMessage { }
     function Update-ProcessPath { }
     function Get-NvmRuntimeDirectory { return $binDirectory }
-    function Set-RuntimePathPriority {
+    function Set-RuntimePath {
+        param($Directory, $Executable, $Name)
+        $calls.Add("path $Directory $Executable")
+    }
+    function Assert-NoRuntimeCommandConflict {
+        param($Name, $ExpectedPath)
+        if ($script:ConflictName -eq $Name) { throw "fixture $Name conflict" }
+    }
+    function Test-RuntimePath {
         param($Directory, $Executable)
-        $calls.Add("priority $Directory $Executable")
+        if ($Executable -eq $script:PersistentConflict) { throw "fixture $Executable PATH conflict" }
+        return $false
     }
     function Assert-RuntimeCommand {
         param($Name, $ExpectedPath)
@@ -368,11 +475,12 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     if (-not (Install-PythonRuntime -PythonVersion '3.14' -LogDirectory 'temp')) {
         throw 'The uv-managed Python installation was not verified.'
     }
-    if ($calls -notcontains 'uv.exe python install 3.14 --upgrade --default --no-config --no-progress' -or
+    if ($calls -notcontains 'uv.exe python install 3.14 --upgrade --no-config --no-progress' -or
+        $calls -notcontains 'uv.exe python install 3.14 --default --no-config --no-progress' -or
         $calls -notcontains 'uv.exe python find cpython3.14 --managed-python --no-python-downloads --no-project --system --no-config' -or
         $calls -notcontains 'uv.exe python dir --bin --no-config' -or
-        $calls -notcontains "priority $binDirectory node.exe" -or
-        $calls -notcontains "priority $binDirectory python.exe" -or
+        $calls -notcontains "path $binDirectory node.exe" -or
+        $calls -notcontains "path $binDirectory python.exe" -or
         $calls -notcontains "resolve python $defaultPython") {
         throw 'The latest Python 3.14 patch was not installed and located through uv.'
     }
@@ -381,9 +489,48 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     $failed = $false
     try { Install-PythonRuntime -PythonVersion '3.14' -LogDirectory 'temp' | Out-Null }
     catch { $failed = $_.Exception.Message -match 'not the selected uv-managed interpreter' }
-    if (-not $failed -or @($calls | Where-Object { $_ -like 'priority *' }).Count -ne 0) {
-        throw 'An unrelated Python in the uv bin directory was accepted or prioritized.'
+    if (-not $failed -or $calls -contains 'uv.exe python install 3.14 --default --no-config --no-progress' -or
+        @($calls | Where-Object { $_ -like 'path *' }).Count -ne 0) {
+        throw 'An unrelated Python in the uv bin directory was accepted or overwritten.'
     }
+    $script:DefaultIdentity = 'managed-python'
+    $script:ConflictName = 'python'
+    $calls.Clear()
+    $failed = $false
+    try { Install-PythonRuntime -PythonVersion '3.14' -LogDirectory 'temp' | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'fixture python conflict' }
+    if (-not $failed -or $calls -notcontains 'uv.exe python install 3.14 --upgrade --no-config --no-progress' -or
+        $calls -contains 'uv.exe python install 3.14 --default --no-config --no-progress') {
+        throw 'A conflicting Python command did not stop default selection after managed installation.'
+    }
+    $script:ConflictName = 'node'
+    $calls.Clear()
+    $failed = $false
+    try { Install-NodeRuntime -LogDirectory 'temp' | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'fixture node conflict' }
+    if (-not $failed -or @($calls | Where-Object { $_ -like 'nvm.exe install *' -or $_ -like 'nvm.exe use *' }).Count -ne 0) {
+        throw 'A conflicting Node command did not prevent nvm installation or activation.'
+    }
+    $script:ConflictName = ''
+    $script:PersistentConflict = 'python.exe'
+    $calls.Clear()
+    $failed = $false
+    try { Install-PythonRuntime -PythonVersion '3.14' -LogDirectory 'temp' | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'python.exe PATH conflict' }
+    if (-not $failed -or $calls -contains 'uv.exe python install 3.14 --default --no-config --no-progress') {
+        throw 'A persistent PATH conflict did not prevent default Python selection.'
+    }
+    $script:PersistentConflict = 'node.exe'
+    $script:CurrentNode = $true
+    $calls.Clear()
+    $failed = $false
+    try { Install-NodeRuntime -LogDirectory 'temp' | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'node.exe PATH conflict' }
+    if (-not $failed -or @($calls | Where-Object { $_ -like 'nvm.exe install *' -or $_ -like 'nvm.exe use *' }).Count) {
+        throw 'A persistent PATH conflict did not prevent Node installation or activation.'
+    }
+    $script:PersistentConflict = ''
+    $script:CurrentNode = $false
     $script:NodeOutput = ''
     $failed = $false
     try { Install-NodeRuntime -LogDirectory 'temp' | Out-Null }
@@ -401,7 +548,35 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
-    foreach ($name in @('Get-PrioritizedRuntimePath', 'Set-RuntimePathPriority', 'Get-NvmRuntimeDirectory', 'Assert-RuntimeCommand', 'Test-RuntimeCommands')) {
+    $definition = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Update-ProcessPath'
+    }, $true)
+    Invoke-Expression $definition.Extent.Text
+    $originalPath = $env:Path
+    $originalNvmHome = $env:NVM_HOME
+    $originalNvmSymlink = $env:NVM_SYMLINK
+    try {
+        $env:Path = 'fixture-first;fixture-second'
+        Update-ProcessPath
+        $entries = @($env:Path -split ';')
+        if ($entries.Count -lt 2 -or $entries[0] -cne 'fixture-first' -or $entries[1] -cne 'fixture-second') {
+            throw 'Refreshing process PATH changed the original entry order.'
+        }
+    }
+    finally {
+        $env:Path = $originalPath
+        $env:NVM_HOME = $originalNvmHome
+        $env:NVM_SYMLINK = $originalNvmSymlink
+    }
+}
+
+& {
+    Set-StrictMode -Version Latest
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
+    foreach ($name in @('Assert-NoRuntimeCommandConflict', 'Test-RuntimePath', 'Set-RuntimePath', 'Get-NvmRuntimeDirectory', 'Assert-RuntimeCommand', 'Test-RuntimeCommands')) {
         $definition = $ast.Find({
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -426,41 +601,53 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
         $env:AGENTBOX_PATH_FIXTURE = $fixture
         $script:PathValues = @{ User = "$other;%AGENTBOX_PATH_FIXTURE%/preferred;$preferred"; Machine = $other }
         $writes = [Collections.Generic.List[string]]::new()
-        $script:AllowMachine = $true
+        $script:AllowPath = $true
         function Get-PersistentRuntimePath { param($Scope) return $script:PathValues[$Scope] }
         function Set-PersistentRuntimePath {
             param($Scope, $Value)
             $script:PathValues[$Scope] = $Value
             $writes.Add($Scope)
         }
-        function Confirm-InstallAction { return $script:AllowMachine }
+        function Confirm-InstallAction { return $script:AllowPath }
         function Write-InstallMessage { }
         function Update-ProcessPath { }
-        Set-RuntimePathPriority -Directory $preferred -Executable 'python.exe'
-        if ($script:PathValues.User -cne "$preferred;$other" -or $writes.Count -ne 1 -or $writes[0] -ne 'User') {
-            throw 'User PATH was not prioritized and deduplicated without a system conflict.'
+        function Get-Command { }
+        Set-RuntimePath -Directory $preferred -Executable 'python.exe' -Name python
+        if ($script:PathValues.User -cne "$other;%AGENTBOX_PATH_FIXTURE%/preferred;$preferred" -or $writes.Count) {
+            throw 'Existing PATH entries or their order were changed.'
         }
-        Set-RuntimePathPriority -Directory $preferred -Executable 'python.exe'
+        $script:PathValues.User = "$other;%AGENTBOX_PATH_FIXTURE%/other"
+        Set-RuntimePath -Directory $preferred -Executable 'python.exe' -Name python
+        if ($script:PathValues.User -cne "$other;%AGENTBOX_PATH_FIXTURE%/other;$preferred" -or
+            $writes.Count -ne 1 -or $writes[0] -ne 'User') {
+            throw 'Runtime directory was not appended while preserving the original user PATH.'
+        }
+        Set-RuntimePath -Directory $preferred -Executable 'python.exe' -Name python
         if ($writes.Count -ne 1) { throw 'Repeated PATH setup was not idempotent.' }
         $script:PathValues.Machine = "%AGENTBOX_PATH_FIXTURE%/conflict;$other"
         $writes.Clear()
-        Set-RuntimePathPriority -Directory $preferred -Executable 'python.exe'
-        if ($script:PathValues.Machine -cne "$preferred;%AGENTBOX_PATH_FIXTURE%/conflict;$other" -or
-            $writes.Count -ne 1 -or $writes[0] -ne 'Machine') {
-            throw 'System PATH conflict was not resolved while preserving unexpanded entries.'
+        $failed = $false
+        try { Set-RuntimePath -Directory $preferred -Executable 'python.exe' -Name python }
+        catch { $failed = $_.Exception.Message -match 'conflict manually' }
+        if (-not $failed -or $writes.Count -or $script:PathValues.Machine -cne "%AGENTBOX_PATH_FIXTURE%/conflict;$other") {
+            throw 'System PATH conflict was not reported without modifying PATH.'
         }
-        Set-RuntimePathPriority -Directory $preferred -Executable 'python.exe'
-        if ($writes.Count -ne 1) { throw 'Repeated system PATH setup was not idempotent.' }
-        $script:PathValues.Machine = $conflict
+        $script:PathValues.Machine = $other
+        $script:PathValues.User = "$conflict;$preferred"
+        $failed = $false
+        try { Set-RuntimePath -Directory $preferred -Executable 'python.exe' -Name python }
+        catch { $failed = $_.Exception.Message -match 'conflict manually' }
+        if (-not $failed -or $writes.Count) { throw 'User PATH conflict was not reported without modifying PATH.' }
         $script:PathValues.User = $other
-        $script:AllowMachine = $false
+        $script:PathValues.Machine = $other
+        $script:AllowPath = $false
         $writes.Clear()
         $failed = $false
-        try { Set-RuntimePathPriority -Directory $preferred -Executable 'python.exe' }
+        try { Set-RuntimePath -Directory $preferred -Executable 'python.exe' -Name python }
         catch { $failed = $_.Exception.Message -match 'declined' }
-        if (-not $failed -or $writes.Count) { throw 'Declined system PATH change was not respected.' }
+        if (-not $failed -or $writes.Count) { throw 'Declined user PATH change was not respected.' }
         $failed = $false
-        try { Set-RuntimePathPriority -Directory $other -Executable 'python.exe' }
+        try { Set-RuntimePath -Directory $other -Executable 'python.exe' -Name python }
         catch { $failed = $_.Exception.Message -match 'invalid' }
         if (-not $failed -or $writes.Count) { throw 'A missing runtime executable was accepted.' }
 
@@ -497,6 +684,10 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
         try { Assert-RuntimeCommand -Name python -ExpectedPath (Join-Path $preferred 'python.exe') }
         catch { $failed = $_.Exception.Message -match 'aliases, functions, and PATH' }
         if (-not $failed) { throw 'A PowerShell function shadowing the runtime was accepted.' }
+        $failed = $false
+        try { Assert-NoRuntimeCommandConflict -Name python -ExpectedPath (Join-Path $preferred 'python.exe') }
+        catch { $failed = $_.Exception.Message -match 'Resolve the conflict manually' }
+        if (-not $failed) { throw 'A PowerShell function conflict was not reported before PATH changes.' }
 
         $npmPath = Join-Path $preferred 'npm.ps1'
         [IO.File]::WriteAllText($npmPath, "Write-Output '1.2.3'; `$global:LASTEXITCODE = 0")
@@ -523,6 +714,46 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
         if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $fixture) {
             Remove-Item -LiteralPath $fixture -Recurse -Force
         }
+    }
+}
+
+& {
+    Set-StrictMode -Version Latest
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
+    $definition = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Install-NvmForWindows'
+    }, $true)
+    Invoke-Expression $definition.Extent.Text
+    $originalNvmHome = $env:NVM_HOME
+    $originalNvmSymlink = $env:NVM_SYMLINK
+    $originalProgramFiles = $env:ProgramFiles
+    try {
+        $env:NVM_HOME = ''
+        $env:NVM_SYMLINK = ''
+        $env:ProgramFiles = ''
+        $script:ExistingNode = $true
+        function Update-ProcessPath { }
+        function Get-Command {
+            param($Name)
+            if ($Name -eq 'node' -and $script:ExistingNode) { return [pscustomobject]@{ Source = 'existing-node.exe' } }
+        }
+        function Confirm-InstallAction { throw 'NVM installer was reached despite an existing runtime.' }
+        foreach ($case in @('command', 'nvm-path')) {
+            $script:ExistingNode = $case -eq 'command'
+            if ($case -eq 'nvm-path') { $env:NVM_HOME = 'existing-nvm-home' }
+            $failed = $false
+            try { Install-NvmForWindows -LogDirectory temp | Out-Null }
+            catch { $failed = $_.Exception.Message -match 'resolve the conflict manually' }
+            if (-not $failed) { throw "NVM installation did not preserve the existing $case." }
+        }
+    }
+    finally {
+        $env:NVM_HOME = $originalNvmHome
+        $env:NVM_SYMLINK = $originalNvmSymlink
+        $env:ProgramFiles = $originalProgramFiles
     }
 }
 
@@ -762,6 +993,55 @@ exit 37
         }
     }
     finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force }
+    }
+}
+
+& {
+    $temporary = Join-Path ([IO.Path]::GetTempPath()) ("agentbox-bootstrap-entry-" + [guid]::NewGuid().ToString('N'))
+    $fixture = Join-Path $temporary 'install-vm-tools.ps1'
+    $previousProgramData = $env:ProgramData
+    $previousMode = $env:AGENTBOX_BOOTSTRAP_TEST_MODE
+    try {
+        $null = New-Item -ItemType Directory -Path $temporary
+        $marker = '# Script entry point.'
+        if (-not $installer.Contains($marker)) { throw 'Agent Box installer entry point was not found.' }
+        $mocks = @'
+function Assert-VmInstallerContext { }
+function Test-RebootPending { return $false }
+function Initialize-WinGet { return 'fixture-winget' }
+function Initialize-AgentPowerShell {
+    if ($env:AGENTBOX_BOOTSTRAP_TEST_MODE -eq 'restart') {
+        $script:RestartRequired = $true
+        return $false
+    }
+    if ($env:AGENTBOX_BOOTSTRAP_TEST_MODE -eq 'declined') { return $false }
+    return $true
+}
+function Invoke-VmToolInstallation {
+    param($LogDirectory, $PythonVersion, $WinGetExecutable)
+    Write-InstallMessage "[PASS] fixture Python=$PythonVersion winget=$WinGetExecutable"
+    return 0
+}
+
+'@
+        [IO.File]::WriteAllText($fixture, $installer.Replace($marker, $mocks + $marker))
+        $env:ProgramData = $temporary
+        foreach ($mode in @('success', 'declined', 'restart')) {
+            $env:AGENTBOX_BOOTSTRAP_TEST_MODE = $mode
+            $output = & pwsh -NoLogo -NoProfile -NonInteractive -File $fixture -Yes -PythonVersion 3.13 2>&1 | Out-String
+            $expected = if ($mode -eq 'success') { 0 } elseif ($mode -eq 'declined') { 1 } elseif ($IsWindows) { 3010 } else { 3010 % 256 }
+            if ($LASTEXITCODE -ne $expected -or $output -notmatch 'Installation logs:' -or
+                ($mode -eq 'success' -and $output -notmatch 'fixture Python=3\.13 winget=fixture-winget')) {
+                throw "Agent Box bootstrap entry fixture failed ($mode): $output"
+            }
+        }
+        $logs = @(Get-ChildItem -LiteralPath (Join-Path $temporary 'AgentBox/Logs/DevTools') -Filter 'install.log' -Recurse)
+        if ($logs.Count -ne 3) { throw 'Agent Box did not create an installation log for each bootstrap run.' }
+    }
+    finally {
+        $env:ProgramData = $previousProgramData
+        $env:AGENTBOX_BOOTSTRAP_TEST_MODE = $previousMode
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force }
     }
 }

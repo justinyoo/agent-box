@@ -60,7 +60,7 @@ The installer displays numbered stages and status messages, and asks before each
 & "$HOME\scripts\install-vm-tools.ps1" -Yes
 ```
 
-If a restart is requested, restart Windows manually and rerun the command. The installer does not authenticate Azure or GitHub tools, sign in to the Copilot app, launch Docker Desktop, create the first Ubuntu user, or automatically reboot Windows. Logs are written below `C:\ProgramData\AgentBox\Logs\DevTools`: `install.log` contains the transcript, and major installation and verification commands have separate `command-*.stdout.log` and `command-*.stderr.log` files.
+Windows PowerShell 5.1 prepares WinGet and PowerShell 7.x, then reruns the installer in PowerShell 7.x. If a restart is requested, restart Windows manually and rerun the command. The installer does not authenticate Azure or GitHub tools, sign in to the Copilot app, launch Docker Desktop, create the first Ubuntu user, or automatically reboot Windows. Logs are written below `C:\ProgramData\AgentBox\Logs\DevTools`: `install.log` contains the transcript, and major installation and verification commands have separate `command-*.stdout.log` and `command-*.stderr.log` files.
 
 | Group | Installs |
 | --- | --- |
@@ -77,9 +77,9 @@ If a restart is requested, restart Windows manually and rerun the command. The i
 
 Existing tools and unrelated Python/Node installations are preserved. The nvm-windows setup is selected from its latest stable GitHub release and validated with its SHA-256 digest and Authenticode signature. The Copilot app uses the official `github/app` x64 MSI and a valid GitHub Authenticode signature; the release SHA-256 digest is checked when GitHub publishes one.
 
-Python installation is attempted even if Node.js setup fails; the installer still reports the Node.js failure. The Python patch version is the latest available in the installed uv release's download catalog. The installer uses uv's experimental `--default` option and prioritizes the uv and nvm executable directories so that `python` and `node` use the installed runtimes in a new terminal. It does not overwrite unrelated executables in the uv bin directory; resolve such conflicts manually and rerun. Use `uv python list --only-installed` to check uv-managed installations.
+Python installation is attempted even if Node.js setup fails; the installer still reports the Node.js failure. The Python patch version is the latest available in the installed uv release's download catalog. If no conflicting Python command or uv-bin executable exists, the installer uses uv's experimental `--default` option to make it available as `python`. Use `uv python list --only-installed` to check uv-managed installations.
 
-The installer updates the signed-in user's PATH. If an executable in the system PATH would take precedence, it also asks before prioritizing the runtime directory in the system PATH (`-Yes` approves this). This affects every user and may point to a directory in the administrator's profile that other users cannot access. User-writable directories in the system PATH can also affect elevated processes; use a trusted VM account and review this change if the VM is shared. Existing terminal processes may need to be reopened or the user signed out and back in.
+The installer preserves existing PATH entries and their order. When needed and there is no conflict, it asks before appending the runtime directory to the signed-in user's PATH (`-Yes` approves this); it never changes the system PATH for runtime priority. A conflicting `node` or `python`, including a WindowsApps alias, must be resolved manually before activation. Existing terminals may need to be reopened or the user signed out and back in. Previous versions of this installer may already have modified the system PATH; this version does not undo those changes.
 
 The repository's installer is a template populated with the configured administrator name during deployment. Use the staged file rather than executing the raw repository file directly.
 
