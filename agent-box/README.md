@@ -76,16 +76,6 @@ The VM and Foundry regions are independent. The Foundry region is limited to `ea
 
    azd prompts for the secure Windows administrator password, Windows client license confirmation, and other missing values.
 
-Override other supported settings with `azd env set`. Numeric and boolean values are accepted as strings and validated during deployment. See [`infra/main.bicep`](infra/main.bicep) and [`infra/main.parameters.json`](infra/main.parameters.json) for the full input mapping.
-
-The initial region picker uses a snapshot of regions where Bastion Developer is documented and both the default VM image and VM size appeared in Azure CLI lookups on 2026-11-22. The SKU lookup included subscription-restricted entries and did not filter regions by availability zone. The snapshot was taken with one subscription, may omit other supported regions, and also applies when a custom image or VM size is configured. A listed SKU does not guarantee availability for a particular subscription.
-
-Before provisioning, the hook checks the image and VM size in the selected subscription and chooses the lowest-numbered unrestricted availability zone. To select a different supported zone, run `azd env set VM_ZONE <zone>`. The selected value is saved in the azd environment and reused on subsequent runs. To select automatically again, clear it with `azd env set VM_ZONE ""`.
-
-If a previously deployed VM is recorded in the environment, the hook verifies and retains its existing zone. A conflicting override stops provisioning. A missing or restricted zone, incomplete zone information, or a failed lookup also stops provisioning; this template does not support non-zonal deployment. The check cannot guarantee quota or capacity. If a lookup fails, check Azure CLI authentication and subscription access.
-
-Resource names follow the azd starter pattern: `rg-{environmentName}` for the resource group and type-specific prefixes such as `vm-`, `vnet-`, and `nsg-` followed by a token derived from the subscription, environment, and VM region. The Foundry account and project use the same token followed by the Foundry region, for example `cogsvc-{resourceToken}-eastus`. Changing the VM region changes the token; changing the Foundry region changes its name suffix. VM and Windows computer name overrides remain available.
-
 ## Sign in and install tools
 
 1. Find the Windows login username in the `azd provision` or `azd up` output. In the Azure portal, select **Connect > Bastion** for the VM, then sign in with that local administrator account (default: `.\agentboxuser`) and the password entered during provisioning.
