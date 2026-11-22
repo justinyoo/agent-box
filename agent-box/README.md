@@ -104,7 +104,11 @@ The installer follows the order below and stops when a restart is required.
 | 7. Editors and apps | VS Code | `Microsoft.VisualStudioCode` |
 | 7. Editors and apps | GitHub Copilot app | Official `github/app` x64 MSI. Verify the GitHub Authenticode signature and the release SHA-256 digest when published |
 
-If no conflicting uv-bin executable exists, the installer uses uv's experimental `--default` option to create `python.exe` even when another Python command takes precedence.
+If no conflicting uv-bin executable exists, the installer uses uv's experimental `--default` option to create `python.exe` even when another Python command takes precedence. For the default Python version, it runs:
+
+```powershell
+uv.exe python install 3.14 --default --no-config --no-progress
+```
 
 ### Manual post-installation steps
 
@@ -115,11 +119,7 @@ If no conflicting uv-bin executable exists, the installer uses uv's experimental
 
 ## Foundry outputs
 
-The template creates one `AIServices` account and project in `MAI_FOUNDRY_REGION`, then deploys `MAI-Image-2.7` as `mai-image-2.7` using the Microsoft format, version `2026-11-02`, and `GlobalStandard` SKU. Capacity defaults to `1` and is configured with `MAI_IMAGE_CAPACITY`.
-
-The image deployment name can be changed with `MAI_IMAGE_DEPLOYMENT_NAME_OVERRIDE`; this changes the deployment name, not the underlying image model.
-
-`MAI-Voice-2.1` and `MAI-Transcribe-2` are Speech API model identifiers, not model deployments created by this template. They can be changed with `MAI_VOICE_MODEL_OVERRIDE` and `MAI_TRANSCRIBE_MODEL_OVERRIDE`; these values are output as provided and are not validated against Speech model availability. The Speech endpoint is the account's `.cognitiveservices.azure.com` endpoint; the Speech region is `MAI_FOUNDRY_REGION`. See the [MAI Voice](https://learn.microsoft.com/azure/ai-services/speech-service/mai-voices) and [MAI Transcribe](https://learn.microsoft.com/azure/ai-services/speech-service/mai-transcribe) usage guides for API formats and current availability.
+The template deploys the `MAI-Image-2.7` image model. It outputs Speech API model identifiers, defaulting to `MAI-Voice-2.1` and `MAI-Transcribe-2`, but does not deploy those models.
 
 Useful deployment outputs include:
 
