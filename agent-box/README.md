@@ -21,11 +21,10 @@ The VM and Foundry regions are independent. The Foundry region is limited to `ea
 
 ## Prerequisites
 
-- Azure Developer CLI (`azd`) 1.35.1 or later, and Azure CLI with Bicep support.
-- Azure permissions to create resource groups, Compute, Network, VM Run Command, and Microsoft Foundry resources. Azure CLI must be signed in with access to the azd environment's subscription.
-- Sufficient quota and capacity for the 64-vCPU VM, its disk, and the Foundry model deployment.
-- Eligibility to run Windows 11 client software in Azure. A required Bicep parameter asks for explicit confirmation.
-- A VM region in the allowlist in [`infra/main.bicep`](infra/main.bicep). The preprovision hook checks the configured VM image, size, and availability zone for the subscription.
+- [Azure subscription](https://aka.ms/azure/free)
+- [`azd` CLI 1.35.1 or later](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd)
+- [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli)
+- [License eligibility to use Windows client in Azure](https://learn.microsoft.com/azure/virtual-machines/windows/windows-desktop-multitenant-hosting-deployment)
 
 ## Deploy
 
