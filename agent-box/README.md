@@ -77,6 +77,8 @@ Windows PowerShell 5.1 prepares WinGet and PowerShell 7.x, then reruns the insta
 
 Existing tools and unrelated Python/Node installations are preserved. The nvm-windows setup is selected from its latest stable GitHub release and validated with its SHA-256 digest and Authenticode signature. The Copilot app uses the official `github/app` x64 MSI and a valid GitHub Authenticode signature; the release SHA-256 digest is checked when GitHub publishes one.
 
+For Copilot CLI, the installer also verifies `copilot --version` when WinGet does not list the package; it reports the discrepancy rather than reinstalling a working CLI. A pending Windows restart stops installation and must be completed manually.
+
 Python installation is attempted even if Node.js setup fails; the installer still reports the Node.js failure. The Python patch version is the latest available in the installed uv release's download catalog. If no conflicting Python command or uv-bin executable exists, the installer uses uv's experimental `--default` option to make it available as `python`. Use `uv python list --only-installed` to check uv-managed installations.
 
 The installer preserves existing PATH entries and their order. When needed and there is no conflict, it asks before appending the runtime directory to the signed-in user's PATH (`-Yes` approves this); it never changes the system PATH for runtime priority. A conflicting `node` or `python`, including a WindowsApps alias, must be resolved manually before activation. Existing terminals may need to be reopened or the user signed out and back in. Previous versions of this installer may already have modified the system PATH; this version does not undo those changes.

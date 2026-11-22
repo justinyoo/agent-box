@@ -165,21 +165,11 @@ function Invoke-LoggedProcess {
 }
 
 # Tool setup and verification.
-function Test-WorkshopPowerShellExecutable {
-    param([string]$Path)
-    try {
-        $major = & $Path -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.Major' 2>$null
-        return $LASTEXITCODE -eq 0 -and "$major".Trim() -match '^\d+$' -and [int]"$major".Trim() -ge 7
-    }
-    catch { return $false }
-}
-
-function Find-WorkshopPowerShell {
+function Find-VmPowerShell {
     $candidates = @(
         Get-Command pwsh -CommandType Application -All -ErrorAction SilentlyContinue |
             ForEach-Object { $_.Source }
     )
-    # winget can finish before the current shell sees the updated PATH.
     foreach ($base in @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
         if ($base) { $candidates += Join-Path $base 'PowerShell\7\pwsh.exe' }
     }
@@ -194,25 +184,28 @@ function Find-WorkshopPowerShell {
         }
     }
     foreach ($candidate in ($candidates | Select-Object -Unique)) {
-        if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and (Test-WorkshopPowerShellExecutable $candidate)) {
-            return $candidate
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        try {
+            $major = & $candidate -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.Major' 2>$null
+            if ($LASTEXITCODE -eq 0 -and "$major".Trim() -eq '7') { return $candidate }
         }
+        catch { Write-InstallMessage "[WARN] Could not inspect PowerShell at $candidate`: $($_.Exception.Message)" }
     }
 }
 
-function Invoke-WorkshopPowerShell {
+function Invoke-VmPowerShell {
     param(
         [string]$ScriptPath,
         [System.Collections.IDictionary]$BoundParameters,
         [object[]]$RemainingArguments
     )
-    $executable = Find-WorkshopPowerShell
+
+    $executable = Find-VmPowerShell
     if (-not $executable) {
-        throw 'PowerShell 7 could not be located. Open a new terminal and retry.'
+        throw 'PowerShell 7.x could not be located. Open a new terminal and retry.'
     }
 
-    # Serialize bound values rather than rebuilding a native command line. This
-    # preserves spaces, Unicode, quotes, arrays and explicitly false switches in 5.1.
+    # Serialize parameters to preserve spaces, Unicode, quotes, arrays and false switches.
     $parameters = @{}
     foreach ($key in $BoundParameters.Keys) {
         $value = $BoundParameters[$key]
@@ -235,8 +228,7 @@ if ($succeeded) { exit 0 }
 if ($LASTEXITCODE -eq 0) { exit 1 }
 exit $LASTEXITCODE
 '@
-    $command = $command.Replace('__DATA__', $data)
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command.Replace('__DATA__', $data)))
     $workerArguments = @('-NoLogo', '-NoProfile', '-InputFormat', 'Text', '-OutputFormat', 'Text')
     $interactive = Test-InstallInteractive
     if (-not $interactive) { $workerArguments += '-NonInteractive' }
@@ -266,15 +258,14 @@ function Test-MinimumVersion {
 }
 
 function Update-ProcessPath {
-    $existing = @($env:PATH -split ';' | Where-Object { $_ })
+    $existing = @($env:Path -split ';' | Where-Object { $_ })
     foreach ($scope in @('Machine', 'User')) {
-        $paths = [Environment]::GetEnvironmentVariable('Path', $scope) -split ';'
-        foreach ($path in $paths) {
-            $expanded = [Environment]::ExpandEnvironmentVariables($path.Trim())
+        foreach ($entry in ([Environment]::GetEnvironmentVariable('Path', $scope) -split ';')) {
+            $expanded = [Environment]::ExpandEnvironmentVariables($entry.Trim())
             if ($expanded -and $expanded -notin $existing) { $existing += $expanded }
         }
     }
-    $env:PATH = $existing -join ';'
+    $env:Path = $existing -join ';'
     foreach ($name in @('NVM_HOME', 'NVM_SYMLINK')) {
         if (-not [Environment]::GetEnvironmentVariable($name, 'Process')) {
             foreach ($scope in @('User', 'Machine')) {
@@ -580,14 +571,31 @@ function Get-VmWingetVersion {
     param([string]$Id, [string]$VersionPattern)
     $arguments = @('show', '--id', $Id, '--exact', '--source', 'winget', '--versions', '--disable-interactivity')
     if ($Yes) { $arguments += '--accept-source-agreements' }
-    $text = (& winget @arguments 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to query $Id versions. Check the source agreements and network access in winget: $text"
+    $executable = Get-Command winget -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $result = Invoke-LoggedProcess -Executable $executable.Source -Arguments $arguments `
+        -LogDirectory $logDirectory -StreamOutput
+    if ($result.ExitCode -ne 0) {
+        throw "Failed to query $Id versions. Check the source agreements and network access in winget: $($result.CombinedOutput)"
     }
-    $versions = @($text -split '\r?\n' | ForEach-Object { $_.Trim() } |
+    $versions = @($result.StandardOutput -split '\r?\n' | ForEach-Object { $_.Trim() } |
         Where-Object { $_ -match $VersionPattern } | ForEach-Object { [version]$_ } | Sort-Object -Descending)
     if (-not $versions.Count) { throw "No stable $Id version matches the required pattern: $VersionPattern" }
     return $versions[0].ToString()
+}
+
+function Test-CopilotCli {
+    param([string]$LogDirectory)
+
+    Update-ProcessPath
+    $command = Get-Command copilot -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $command) { return $false }
+    $result = Invoke-LoggedProcess -Executable $command.Source -Arguments @('--version') `
+        -LogDirectory $LogDirectory -StreamOutput -Quiet
+    if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result.StandardOutput)) {
+        throw "The existing Copilot CLI at $($command.Source) could not be verified. See $LogDirectory."
+    }
+    return $true
 }
 
 function Install-VmPackage {
@@ -641,7 +649,7 @@ function Initialize-VmWinget {
 }
 
 function Test-VmPowerShell7 {
-    $path = Find-WorkshopPowerShell
+    $path = Find-VmPowerShell
     if (-not $path) { return $false }
     $major = & $path -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.Major'
     if ($LASTEXITCODE -ne 0 -or "$major".Trim() -ne '7') { throw 'Check the stable PowerShell 7.x path.' }
@@ -940,18 +948,18 @@ function Install-VmVisualStudio {
         -TestInstalled { [bool](Get-VmVsInstance $Product $components) }
 }
 
-function Get-VmCopilotVersion {
+function Get-CopilotAppVersion {
     foreach ($root in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
-        if (-not (Test-Path $root)) { continue }
-        foreach ($key in Get-ChildItem $root -ErrorAction Stop) {
-            $app = Get-ItemProperty $key.PSPath -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($key in Get-ChildItem -LiteralPath $root -ErrorAction Stop) {
+            $app = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
             if ($app.PSObject.Properties['DisplayName'] -and $app.DisplayName -match '^GitHub Copilot( App)?$') {
                 $version = $null
                 if (-not $app.PSObject.Properties['DisplayVersion'] -or
                     -not [version]::TryParse($app.DisplayVersion, [ref]$version)) {
-                    throw 'Could not read the installed Copilot app version.'
+                    throw 'Could not read the installed GitHub Copilot app version.'
                 }
                 return $version
             }
@@ -959,37 +967,57 @@ function Get-VmCopilotVersion {
     }
 }
 
-function Install-VmCopilot {
-    $existing = Get-VmCopilotVersion
-    if ($existing) { Write-InstallMessage "[PASS] Keeping GitHub Copilot app $existing. Sign in manually."; return $true }
-    if (-not (Confirm-InstallAction 'Install the GitHub Copilot app from the official github/app stable release. This is not Copilot CLI.')) { return $false }
-    $release = Invoke-RestMethod 'https://api.github.com/repos/github/app/releases/latest' -ErrorAction Stop
+function Install-CopilotApp {
+    $existing = Get-CopilotAppVersion
+    if ($existing) {
+        Write-InstallMessage "[PASS] Keeping GitHub Copilot app $existing. Sign in manually."
+        return $true
+    }
+    if (-not (Confirm-InstallAction 'Install the GitHub Copilot app from the official github/app stable x64 MSI.')) {
+        Write-InstallMessage '[MANUAL] Skipped the GitHub Copilot app installation.'
+        return $false
+    }
+    $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/github/app/releases/latest' `
+        -Headers @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } `
+        -UserAgent 'AgentBox-VM-Setup' -TimeoutSec 60 -ErrorAction Stop
     if ($release.prerelease -or $release.draft -or $release.tag_name -notmatch '^v?(\d+\.\d+\.\d+)$') {
-        throw 'Could not find a stable Copilot app release.'
+        throw 'GitHub did not return a stable Copilot app release.'
     }
     $expectedVersion = [version]$Matches[1]
     $assets = @($release.assets | Where-Object name -eq 'GitHub-Copilot-windows-x64.msi')
     if ($assets.Count -ne 1 -or $assets[0].browser_download_url -notlike 'https://github.com/github/app/releases/download/*') {
-        throw 'Could not find the official Windows x64 MSI.'
+        throw 'The official GitHub Copilot x64 MSI was not found.'
     }
-    $path = Join-Path $env:TEMP ("appmod-copilot-$([guid]::NewGuid().ToString('N')).msi")
+    $path = Join-Path $env:TEMP ("vm-copilot-$([guid]::NewGuid().ToString('N')).msi")
     try {
-        Invoke-WebRequest -Uri $assets[0].browser_download_url -OutFile $path -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest -Uri $assets[0].browser_download_url -OutFile $path -UseBasicParsing `
+            -UserAgent 'AgentBox-VM-Setup' -TimeoutSec 180 -ErrorAction Stop
         $digest = if ($assets[0].PSObject.Properties['digest']) { [string]$assets[0].digest } else { '' }
-        if ($digest -match '^sha256:([a-fA-F0-9]{64})$') {
-            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $Matches[1]) { throw 'The Copilot MSI hash does not match.' }
+        if ($digest) {
+            if ($digest -notmatch '^sha256:([a-fA-F0-9]{64})$') {
+                throw 'GitHub returned an unsupported Copilot MSI digest.'
+            }
+            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash -ine $Matches[1]) {
+                throw 'The Copilot MSI SHA-256 digest does not match the GitHub release.'
+            }
         }
-        $signature = Get-AuthenticodeSignature -LiteralPath $path
+        $signature = Get-AuthenticodeSignature -LiteralPath $path -ErrorAction Stop
         if ($signature.Status -ne 'Valid' -or
             $signature.SignerCertificate.Subject -notmatch '(CN|O)="?GitHub(,? Inc\.?)?"?(,|$)') {
-            throw 'Could not verify a valid GitHub signature on the Copilot MSI.'
+            throw 'The Copilot MSI does not have a valid GitHub Authenticode signature.'
         }
         $process = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') `
             -ArgumentList "/i `"$path`" /passive /norestart" -Wait -PassThru -ErrorAction Stop
-        if ($process.ExitCode -in @(1641, 3010)) { $script:RestartRequired = $true; return $false }
-        if ($process.ExitCode -ne 0) { throw "Copilot app MSI installation failed (exit code $($process.ExitCode))." }
-        $installed = Get-VmCopilotVersion
-        if (-not $installed -or $installed -lt $expectedVersion) { throw 'Could not verify the Copilot app version after installation.' }
+        if ($process.ExitCode -in @(1641, 3010)) {
+            $script:RestartRequired = $true
+            Write-InstallMessage '[MANUAL] The Copilot app requested a Windows restart. Restart manually and rerun this script.'
+            return $false
+        }
+        if ($process.ExitCode -ne 0) { throw "Copilot app installation failed (exit code $($process.ExitCode))." }
+        $installed = Get-CopilotAppVersion
+        if (-not $installed -or $installed -lt $expectedVersion) {
+            throw 'Could not verify the installed GitHub Copilot app version.'
+        }
         Write-InstallMessage "[PASS] Installed GitHub Copilot app $installed. Sign in manually."
         return $true
     }
@@ -1084,19 +1112,23 @@ function Test-VmFrameworkTools {
 
 # Installer context and stages.
 function Assert-VmInstallerContext {
-    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or -not [Environment]::Is64BitProcess) {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
+        -not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
         throw 'Run this installer from Windows x64 PowerShell.'
     }
     if (-not $Yes -and -not (Test-InstallInteractive)) {
         throw 'Installation requires an interactive administrator session or the explicit -Yes switch.'
     }
-    $current = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($identity.User.Value -eq 'S-1-5-18') {
+        throw 'Do not run this script as SYSTEM. Sign in as the configured local administrator and run it manually.'
+    }
     $adminUsername = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ADMIN_USERNAME_BASE64__'))
     $account = Get-LocalUser -Name $adminUsername -ErrorAction Stop
-    if ($current.IsSystem -or -not $account.Enabled -or $current.User.Value -ne $account.SID.Value) {
+    if (-not $account.Enabled -or $identity.User.Value -ne $account.SID.Value) {
         throw "Sign in as the configured local administrator $adminUsername before running this installer."
     }
-    $principal = New-Object Security.Principal.WindowsPrincipal($current)
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw 'Open PowerShell as administrator under the signed-in local administrator account.'
     }
@@ -1142,7 +1174,7 @@ function Invoke-VmToolInstallation {
             }
         } },
         @{ Name='GitHub Copilot CLI'; Run={
-            Install-VmPackage GitHub.Copilot 'GitHub Copilot CLI' -TestInstalled { Test-VmCommand copilot }
+            Install-VmPackage GitHub.Copilot 'GitHub Copilot CLI' -TestInstalled { Test-CopilotCli -LogDirectory $logDirectory }
         } },
         @{ Group='[7/8] Azure tools'; Name='Azure CLI'; Run={ Install-VmPackage Microsoft.AzureCLI 'Azure CLI' -TestInstalled { Test-VmCommand az } } },
         @{ Name='azd'; Run={ Install-VmPackage Microsoft.Azd azd -TestInstalled { Test-VmCommand azd @('version') } } },
@@ -1152,7 +1184,7 @@ function Invoke-VmToolInstallation {
                     (Join-Path $env:ProgramFiles 'Microsoft VS Code\Code.exe'))
             }
         } },
-        @{ Name='GitHub Copilot app'; Run={ Install-VmCopilot } },
+        @{ Name='GitHub Copilot app'; Run={ Install-CopilotApp } },
         @{ Name='Modernize CLI'; Run={
             Install-VmPackage GitHub.Copilot.modernization.agent 'Modernize CLI' -TestInstalled { Test-VmCommand modernize }
         } }
@@ -1166,6 +1198,7 @@ function Invoke-VmToolInstallation {
         catch {
             $failed = $true
             Write-InstallMessage "[FAIL] $($step.Name): $($_.Exception.Message)"
+            if ($_.ScriptStackTrace) { Write-InstallMessage "[INFO] $($_.ScriptStackTrace)" }
         }
         if ($script:RestartRequired -or (Test-RebootPending)) {
             Write-InstallMessage '[MANUAL] A restart is required. The script does not restart automatically. Restart and rerun the same command.'
@@ -1210,7 +1243,7 @@ else {
             exit 1
         }
         if ($PSVersionTable.PSVersion.Major -lt 7) {
-            exit (Invoke-WorkshopPowerShell -ScriptPath $PSCommandPath `
+            exit (Invoke-VmPowerShell -ScriptPath $PSCommandPath `
                 -BoundParameters @{ Track = 'dotnet'; Yes = [bool]$Yes } -RemainingArguments @())
         }
         if ($PSVersionTable.PSVersion.Major -ne 7) { throw 'Run this script in PowerShell 7.x.' }
@@ -1218,6 +1251,7 @@ else {
     }
     catch {
         Write-Error "[FAIL] $($_.Exception.Message)" -ErrorAction Continue
+        if ($_.ScriptStackTrace) { Write-InstallMessage "[INFO] $($_.ScriptStackTrace)" }
         exit 1
     }
     finally {

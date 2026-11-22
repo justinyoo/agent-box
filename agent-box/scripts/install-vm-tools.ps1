@@ -175,7 +175,7 @@ function Invoke-WinGetCommand {
         [string]$LogDirectory
     )
 
-    $result = Invoke-LoggedProcess @PSBoundParameters
+    $result = Invoke-LoggedProcess @PSBoundParameters -StreamOutput
     return $result.ExitCode
 }
 
@@ -206,7 +206,7 @@ function Invoke-ToolCommand {
     return ([string]$result.StandardOutput).Trim()
 }
 
-function Find-AgentPowerShell {
+function Find-VmPowerShell {
     $candidates = @(
         Get-Command pwsh -CommandType Application -All -ErrorAction SilentlyContinue |
             ForEach-Object { $_.Source }
@@ -234,24 +234,36 @@ function Find-AgentPowerShell {
     }
 }
 
-function Invoke-AgentPowerShell {
-    param([string]$ScriptPath, [System.Collections.IDictionary]$BoundParameters)
+function Invoke-VmPowerShell {
+    param(
+        [string]$ScriptPath,
+        [System.Collections.IDictionary]$BoundParameters,
+        [object[]]$RemainingArguments
+    )
 
-    $executable = Find-AgentPowerShell
-    if (-not $executable) { throw 'PowerShell 7.x could not be located. Open a new terminal and retry.' }
+    $executable = Find-VmPowerShell
+    if (-not $executable) {
+        throw 'PowerShell 7.x could not be located. Open a new terminal and retry.'
+    }
+
+    # Serialize parameters to preserve spaces, Unicode, quotes, arrays and false switches.
     $parameters = @{}
     foreach ($key in $BoundParameters.Keys) {
         $value = $BoundParameters[$key]
         if ($value -is [Management.Automation.SwitchParameter]) { $value = [bool]$value }
         $parameters[$key] = $value
     }
-    $payload = [Management.Automation.PSSerializer]::Serialize(@{ Path = $ScriptPath; Parameters = $parameters })
+    $payload = [Management.Automation.PSSerializer]::Serialize(@{
+        Path = $ScriptPath; Parameters = $parameters; Arguments = $RemainingArguments
+    })
     $data = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
     $command = @'
 $payload = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('__DATA__')))
 $parameters = $payload.Parameters
+$arguments = @()
+if ($null -ne $payload.Arguments) { $arguments = @($payload.Arguments) }
 $global:LASTEXITCODE = 0
-& $payload.Path @parameters
+& $payload.Path @parameters @arguments
 $succeeded = $?
 if ($succeeded) { exit 0 }
 if ($LASTEXITCODE -eq 0) { exit 1 }
@@ -263,6 +275,7 @@ exit $LASTEXITCODE
     if (-not $interactive) { $workerArguments += '-NonInteractive' }
     $workerArguments += @('-EncodedCommand', $encoded)
     if ($interactive) {
+        # Inherit console handles instead of redirecting the worker through a pipeline.
         $worker = Start-Process -FilePath $executable -ArgumentList $workerArguments -NoNewWindow -Wait -PassThru -ErrorAction Stop
         return $worker.ExitCode
     }
@@ -271,6 +284,14 @@ exit $LASTEXITCODE
 }
 
 function Update-ProcessPath {
+    $existing = @($env:Path -split ';' | Where-Object { $_ })
+    foreach ($scope in @('Machine', 'User')) {
+        foreach ($entry in ([Environment]::GetEnvironmentVariable('Path', $scope) -split ';')) {
+            $expanded = [Environment]::ExpandEnvironmentVariables($entry.Trim())
+            if ($expanded -and $expanded -notin $existing) { $existing += $expanded }
+        }
+    }
+    $env:Path = $existing -join ';'
     foreach ($name in @('NVM_HOME', 'NVM_SYMLINK')) {
         if (-not [Environment]::GetEnvironmentVariable($name, 'Process')) {
             foreach ($scope in @('User', 'Machine')) {
@@ -281,14 +302,6 @@ function Update-ProcessPath {
                 }
             }
         }
-        $existing = @($env:Path -split ';' | Where-Object { $_ })
-        foreach ($scope in @('Machine', 'User')) {
-            foreach ($entry in ([Environment]::GetEnvironmentVariable('Path', $scope) -split ';')) {
-                $expanded = [Environment]::ExpandEnvironmentVariables($entry.Trim())
-                if ($expanded -and $expanded -notin $existing) { $existing += $expanded }
-            }
-        }
-        $env:Path = $existing -join ';'
     }
 }
 
@@ -445,7 +458,7 @@ function Get-LatestPowerShell7Version {
 
     $arguments = @('show', '--id', 'Microsoft.PowerShell', '--exact', '--source', 'winget', '--versions', '--disable-interactivity')
     if ($Yes) { $arguments += '--accept-source-agreements' }
-    $result = Invoke-LoggedProcess -Executable $WinGetExecutable -Arguments $arguments -LogDirectory $LogDirectory
+    $result = Invoke-LoggedProcess -Executable $WinGetExecutable -Arguments $arguments -LogDirectory $LogDirectory -StreamOutput
     if ($result.ExitCode -ne 0) { throw "Could not query PowerShell versions. See $LogDirectory." }
     $versions = @(([string]$result.StandardOutput -split '\r?\n') |
         ForEach-Object { $_.Trim() } |
@@ -453,6 +466,21 @@ function Get-LatestPowerShell7Version {
         ForEach-Object { [version]$_ } | Sort-Object -Descending)
     if (-not $versions.Count) { throw 'WinGet did not return a stable PowerShell 7.x version.' }
     return $versions[0].ToString()
+}
+
+function Test-CopilotCli {
+    param([string]$LogDirectory)
+
+    Update-ProcessPath
+    $command = Get-Command copilot -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $command) { return $false }
+    $result = Invoke-LoggedProcess -Executable $command.Source -Arguments @('--version') `
+        -LogDirectory $LogDirectory -StreamOutput -Quiet
+    if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result.StandardOutput)) {
+        throw "The existing Copilot CLI at $($command.Source) could not be verified. See $LogDirectory."
+    }
+    return $true
 }
 
 function Install-DevToolPackages {
@@ -469,7 +497,7 @@ function Install-DevToolPackages {
         @{ Group = 'Runtimes'; Id = 'Microsoft.DotNet.SDK.10'; Name = '.NET 10 SDK'; Extra = @() }
         @{ Group = 'Runtimes'; Id = 'Microsoft.DotNet.SDK.11'; Name = '.NET 11 SDK'; Extra = @() }
         @{ Group = 'Runtimes'; Id = 'astral-sh.uv'; Name = 'uv'; Extra = @() }
-        @{ Group = 'Containers'; Id = 'Docker.DockerDesktop'; Name = 'Docker Desktop (WSL2 backend)'; Extra = @('--override', '"install --backend=wsl-2"') }
+        @{ Group = 'Containers'; Id = 'Docker.DockerDesktop'; Name = 'Docker Desktop (WSL2 backend)'; Extra = @('--override', 'install --backend=wsl-2') }
         @{ Group = 'GitHub'; Id = 'Git.Git'; Name = 'Git'; Extra = @() }
         @{ Group = 'GitHub'; Id = 'GitHub.cli'; Name = 'GitHub CLI'; Extra = @() }
         @{ Group = 'GitHub'; Id = 'GitHub.Copilot'; Name = 'GitHub Copilot CLI'; Extra = @() }
@@ -487,6 +515,11 @@ function Install-DevToolPackages {
     $complete = $true
     foreach ($package in $packages) {
         if ($package.Group -ne $Group) { continue }
+        if (Test-RebootPending) {
+            $script:RestartRequired = $true
+            Write-InstallMessage '[MANUAL] A Windows restart is pending. Restart manually and rerun this script.'
+            return $false
+        }
         $id = $package.Id
         if ($id -eq 'Docker.DockerDesktop' -and -not (Test-WslPlatform)) {
             Write-InstallMessage '[MANUAL] Docker Desktop is waiting for a ready WSL2 platform.'
@@ -505,6 +538,10 @@ function Install-DevToolPackages {
         }
         if ($code -ne $notInstalled) {
             throw ('Cannot determine whether {0} is installed (0x{1:X8}). See {2}.' -f $id, $code, $LogDirectory)
+        }
+        if ($id -eq 'GitHub.Copilot' -and (Test-CopilotCli -LogDirectory $LogDirectory)) {
+            Write-InstallMessage '[WARN] WinGet did not list GitHub Copilot CLI, but its executable was verified. Keeping the existing installation.'
+            continue
         }
         if (-not (Confirm-InstallAction "Install $($package.Name) with WinGet and accept its package agreements.")) {
             Write-InstallMessage "[MANUAL] Skipped the $($package.Name) installation."
@@ -532,10 +569,20 @@ function Install-DevToolPackages {
         if ($code -ne 0 -and $alreadyInstalled -notcontains $code) {
             throw ('Installation of {0} failed (0x{1:X8}). See {2}.' -f $id, $code, $LogDirectory)
         }
+        if (Test-RebootPending) {
+            $script:RestartRequired = $true
+            Write-InstallMessage '[MANUAL] A Windows restart is pending. Restart manually and rerun this script.'
+            return $false
+        }
 
         $code = Invoke-WinGetCommand -Executable $WinGetExecutable -Arguments $query `
             -LogDirectory $LogDirectory
         if ($code -ne 0) {
+            if ($id -eq 'GitHub.Copilot' -and $code -eq $notInstalled -and
+                (Test-CopilotCli -LogDirectory $LogDirectory)) {
+                Write-InstallMessage '[WARN] WinGet did not list GitHub Copilot CLI after installation, but its executable was verified.'
+                continue
+            }
             throw ('{0} was not verified after installation (0x{1:X8}). See {2}.' -f $id, $code, $LogDirectory)
         }
         Write-InstallMessage "[PASS] Verified the $($package.Name) installation."
@@ -546,14 +593,14 @@ function Install-DevToolPackages {
 function Initialize-AgentPowerShell {
     param([string]$WinGetExecutable, [string]$LogDirectory)
 
-    if (Find-AgentPowerShell) {
+    if (Find-VmPowerShell) {
         Write-InstallMessage '[PASS] PowerShell 7.x is installed. Keeping the existing installation.'
         return $true
     }
     if (-not (Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Prerequisites)) {
         return $false
     }
-    if (-not (Find-AgentPowerShell)) {
+    if (-not (Find-VmPowerShell)) {
         throw 'PowerShell 7.x could not be verified after installation. Open a new terminal and rerun.'
     }
     return $true
@@ -830,7 +877,7 @@ function Install-CopilotApp {
     if ($assets.Count -ne 1 -or $assets[0].browser_download_url -notlike 'https://github.com/github/app/releases/download/*') {
         throw 'The official GitHub Copilot x64 MSI was not found.'
     }
-    $path = Join-Path $env:TEMP ("agentbox-copilot-$([guid]::NewGuid().ToString('N')).msi")
+    $path = Join-Path $env:TEMP ("vm-copilot-$([guid]::NewGuid().ToString('N')).msi")
     try {
         Invoke-WebRequest -Uri $assets[0].browser_download_url -OutFile $path -UseBasicParsing `
             -UserAgent 'AgentBox-VM-Setup' -TimeoutSec 180 -ErrorAction Stop
@@ -872,7 +919,7 @@ function Test-DevToolCommands {
     param([string]$LogDirectory)
 
     Update-ProcessPath
-    $powerShell = Find-AgentPowerShell
+    $powerShell = Find-VmPowerShell
     if (-not $powerShell) { throw 'PowerShell 7.x could not be located.' }
     $checks = @(
         @{ Command = $powerShell; Arguments = @('--version') }
@@ -1118,11 +1165,12 @@ function Test-RuntimeCommands {
 
 # Installer context and stages.
 function Assert-VmInstallerContext {
-    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
-        throw 'This installer requires Windows. It does not install anything on this host.'
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
+        -not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
+        throw 'Run this installer from Windows x64 PowerShell.'
     }
-    if (-not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
-        throw 'Run this script in a 64-bit PowerShell process on Windows x64.'
+    if (-not $Yes -and -not (Test-InstallInteractive)) {
+        throw 'Installation requires an interactive administrator session or the explicit -Yes switch.'
     }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     if ($identity.User.Value -eq 'S-1-5-18') {
@@ -1145,59 +1193,55 @@ function Invoke-VmToolInstallation {
     $script:RestartRequired = $false
     $complete = $true
     Update-ProcessPath
-    Write-InstallMessage '[INFO] === [2/7] Windows features ==='
-    if (-not (Install-WslPlatform)) {
-        $complete = $false
-        if ($script:RestartRequired) { return 3010 }
-    }
-    if (Test-WslPlatform) {
-        if (-not (Install-UbuntuWsl)) {
+    $steps = @(
+        @{ Group='[2/7] Windows features'; Run={ Install-WslPlatform } },
+        @{ Run={
+            if (Test-WslPlatform) { return (Install-UbuntuWsl) }
+            Write-InstallMessage '[MANUAL] Ubuntu requires the WSL2 platform. Complete that step and restart first.'
+            return $false
+        } },
+        @{ Group='[3/7] Runtimes and SDKs'; Run={
+            Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Runtimes
+        } },
+        @{ Run={
+            try {
+                if (-not (Install-NvmForWindows -LogDirectory $LogDirectory)) {
+                    Write-InstallMessage '[MANUAL] nvm-windows is not ready.'
+                    return $false
+                }
+                return (Install-NodeRuntime -LogDirectory $LogDirectory)
+            }
+            catch {
+                Write-InstallMessage "[FAIL] Node.js installation failed: $($_.Exception.Message)"
+                if ($_.ScriptStackTrace) { Write-InstallMessage "[INFO] $($_.ScriptStackTrace)" }
+                return $false
+            }
+        } },
+        @{ Run={ Install-PythonRuntime -PythonVersion $PythonVersion -LogDirectory $LogDirectory } },
+        @{ Group='[4/7] Containers'; Run={
+            Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Containers
+        } },
+        @{ Group='[5/7] GitHub tools'; Run={
+            Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group GitHub
+        } },
+        @{ Group='[6/7] Azure tools'; Run={
+            Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Azure
+        } },
+        @{ Group='[7/7] Editors and apps'; Run={
+            Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Editors
+        } },
+        @{ Run={ Install-CopilotApp } }
+    )
+    foreach ($step in $steps) {
+        if ($step.ContainsKey('Group')) { Write-InstallMessage "[INFO] === $($step.Group) ===" }
+        if (-not (& $step.Run)) {
             $complete = $false
-            if ($script:RestartRequired) { return 3010 }
+        }
+        if ($script:RestartRequired -or (Test-RebootPending)) {
+            Write-InstallMessage '[MANUAL] A restart is required. The script does not restart automatically. Restart and rerun the same command.'
+            return 3010
         }
     }
-    else {
-        Write-InstallMessage '[MANUAL] Ubuntu requires the WSL2 platform. Complete that step and restart first.'
-        $complete = $false
-    }
-
-    Write-InstallMessage '[INFO] === [3/7] Runtimes and SDKs ==='
-    if (-not (Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group Runtimes)) {
-        $complete = $false
-        if ($script:RestartRequired) { return 3010 }
-    }
-    try {
-        if (-not (Install-NvmForWindows -LogDirectory $LogDirectory)) {
-            Write-InstallMessage '[MANUAL] nvm-windows is not ready.'
-            $complete = $false
-        }
-        elseif (-not (Install-NodeRuntime -LogDirectory $LogDirectory)) {
-            $complete = $false
-        }
-    }
-    catch {
-        Write-InstallMessage "[FAIL] Node.js installation failed: $($_.Exception.Message)"
-        if ($_.ScriptStackTrace) { Write-InstallMessage "[INFO] $($_.ScriptStackTrace)" }
-        $complete = $false
-    }
-    if (-not (Install-PythonRuntime -PythonVersion $PythonVersion -LogDirectory $LogDirectory)) {
-        $complete = $false
-    }
-
-    foreach ($group in @(
-        @{ Name = 'Containers'; Label = '[4/7] Containers' }
-        @{ Name = 'GitHub'; Label = '[5/7] GitHub tools' }
-        @{ Name = 'Azure'; Label = '[6/7] Azure tools' }
-        @{ Name = 'Editors'; Label = '[7/7] Editors and apps' }
-    )) {
-        Write-InstallMessage "[INFO] === $($group.Label) ==="
-        if (-not (Install-DevToolPackages -WinGetExecutable $WinGetExecutable -LogDirectory $LogDirectory -Group $group.Name)) {
-            $complete = $false
-            if ($script:RestartRequired) { return 3010 }
-        }
-    }
-    if (-not (Install-CopilotApp)) { $complete = $false }
-    if ($script:RestartRequired) { return 3010 }
 
     try {
         Test-DevToolCommands -LogDirectory $LogDirectory
@@ -1247,7 +1291,7 @@ try {
         exit 1
     }
     if ($PSVersionTable.PSVersion.Major -lt 7) {
-        exit (Invoke-AgentPowerShell -ScriptPath $PSCommandPath `
+        exit (Invoke-VmPowerShell -ScriptPath $PSCommandPath `
             -BoundParameters @{ PythonVersion = $PythonVersion; Yes = [bool]$Yes })
     }
     if ($PSVersionTable.PSVersion.Major -ne 7) { throw 'Run this script in PowerShell 7.x.' }

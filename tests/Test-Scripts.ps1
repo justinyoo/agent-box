@@ -47,6 +47,46 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
 }
 
 & {
+    $trees = @{}
+    foreach ($project in @('agent-box', 'appmod-box')) {
+        $tokens = $null
+        $errors = $null
+        $trees[$project] = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $RepositoryRoot "$project/scripts/install-vm-tools.ps1"), [ref]$tokens, [ref]$errors
+        )
+    }
+    foreach ($name in @('Test-InstallOutputTerminal', 'Write-InstallMessage', 'Test-InstallInteractive',
+            'Confirm-InstallAction', 'Test-RebootPending', 'Invoke-LoggedProcess', 'Find-VmPowerShell',
+            'Invoke-VmPowerShell', 'Update-ProcessPath', 'Test-CopilotCli',
+            'Get-CopilotAppVersion', 'Install-CopilotApp', 'Assert-VmInstallerContext')) {
+        $definitions = foreach ($project in @('agent-box', 'appmod-box')) {
+            $definition = $trees[$project].Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+            }, $true)
+            if (-not $definition) { throw "Missing $project common function: $name" }
+            $definition.Extent.Text
+        }
+        if ($definitions[0] -cne $definitions[1]) { throw "Installer common function differs: $name" }
+    }
+    $docker = @($trees['appmod-box'].FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq 'Install-VmPackage' -and
+            $node.Extent.Text -match 'Docker\.DockerDesktop'
+    }, $true))
+    if ($docker.Count -ne 1) { throw 'Workshop Docker installation command was not found uniquely.' }
+    function Install-VmPackage {
+        param($Id, $Name, $TestInstalled, $ExtraArguments)
+        if ($ExtraArguments.Count -ne 2 -or $ExtraArguments[0] -ne '--override') {
+            throw 'Workshop Docker installation did not supply the expected override.'
+        }
+        $script:AppmodDockerOverrideArgument = $ExtraArguments[1]
+    }
+    Invoke-Expression $docker[0].Extent.Text
+}
+
+& {
     Set-StrictMode -Version Latest
     $tokens = $null
     $errors = $null
@@ -134,7 +174,7 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
-    foreach ($name in @('Initialize-AgentPowerShell', 'Invoke-AgentPowerShell', 'Get-LatestPowerShell7Version')) {
+    foreach ($name in @('Initialize-AgentPowerShell', 'Invoke-VmPowerShell', 'Get-LatestPowerShell7Version')) {
         $definition = $ast.Find({
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -145,7 +185,7 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     $script:PowerShellReady = $false
     $script:PowerShellInstalls = 0
     $script:PowerShellInstallResult = $true
-    function Find-AgentPowerShell {
+    function Find-VmPowerShell {
         if ($script:PowerShellReady) { return (Get-Process -Id $PID).Path }
     }
     function Install-DevToolPackages {
@@ -195,12 +235,12 @@ param([string]$PythonVersion, [switch]$Yes)
 exit 37
 '@)
         $env:AGENTBOX_BOOTSTRAP_TEST_OUTPUT = $result
-        $code = Invoke-AgentPowerShell -ScriptPath $worker -BoundParameters @{ PythonVersion = '3.14'; Yes = $true }
+        $code = Invoke-VmPowerShell -ScriptPath $worker -BoundParameters @{ PythonVersion = '3.14'; Yes = $true }
         $stored = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
         if ($code -ne 37 -or $stored.PythonVersion -ne '3.14' -or -not $stored.Yes) {
             throw 'Agent Box PowerShell bootstrap did not preserve parameters or the worker exit code.'
         }
-        $code = Invoke-AgentPowerShell -ScriptPath $worker -BoundParameters @{ PythonVersion = '3.13'; Yes = $false }
+        $code = Invoke-VmPowerShell -ScriptPath $worker -BoundParameters @{ PythonVersion = '3.13'; Yes = $false }
         $stored = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
         if ($code -ne 37 -or $stored.PythonVersion -ne '3.13' -or $stored.Yes) {
             throw 'Agent Box PowerShell bootstrap did not preserve a false consent switch.'
@@ -210,6 +250,78 @@ exit 37
         $env:AGENTBOX_BOOTSTRAP_TEST_OUTPUT = $previousOutput
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force }
     }
+}
+
+& {
+    $tokens = $null
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
+    foreach ($name in @('Install-DevToolPackages', 'Test-CopilotCli')) {
+        $definition = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+        }, $true)
+        Invoke-Expression $definition.Extent.Text
+    }
+    $Yes = $true
+    $script:CliInstalled = $false
+    $script:CliRuns = $false
+    $script:CliQueryError = $false
+    $script:InstallCalls = 0
+    function Test-RebootPending { return $false }
+    function Update-ProcessPath { }
+    function Write-InstallMessage { }
+    function Confirm-InstallAction { return $true }
+    function Get-Command {
+        if ($script:CliRuns) { return [pscustomobject]@{ Source = 'fixture-copilot.exe' } }
+    }
+    function Invoke-LoggedProcess {
+        return [pscustomobject]@{ ExitCode = 0; StandardOutput = '1.2.3' }
+    }
+    function Invoke-WinGetCommand {
+        param($Executable, $Arguments, $LogDirectory)
+        if ($Arguments[2] -ne 'GitHub.Copilot') { return 0 }
+        if ($Arguments[0] -eq 'install') {
+            $script:InstallCalls++
+            $script:CliInstalled = $true
+            return 0
+        }
+        if ($script:CliQueryError -and $script:CliInstalled) { return 42 }
+        return [Convert]::ToUInt32('8A150014', 16)
+    }
+    $script:CliRuns = $true
+    if (-not (Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group GitHub) -or
+        $script:InstallCalls -ne 0) {
+        throw 'A working Copilot CLI not listed by WinGet was not preserved.'
+    }
+    $script:CliRuns = $false
+    $script:CliInstalled = $false
+    function Get-Command {
+        if ($script:CliInstalled) { return [pscustomobject]@{ Source = 'fixture-copilot.exe' } }
+    }
+    if (-not (Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group GitHub) -or
+        $script:InstallCalls -ne 1) {
+        throw 'A working Copilot CLI was not verified after WinGet omitted it from the list.'
+    }
+    $script:CliInstalled = $false
+    $script:CliQueryError = $true
+    $failed = $false
+    try { Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group GitHub | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'was not verified after installation' }
+    if (-not $failed) { throw 'A WinGet query error was ignored during Copilot CLI verification.' }
+    $script:CliQueryError = $false
+    $script:CliInstalled = $false
+    function Invoke-LoggedProcess { return [pscustomobject]@{ ExitCode = 1; StandardOutput = '' } }
+    $failed = $false
+    try { Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group GitHub | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'Copilot CLI.*could not be verified' }
+    if (-not $failed) { throw 'An invalid Copilot CLI executable was accepted.' }
+    $script:CliInstalled = $false
+    function Get-Command { }
+    $failed = $false
+    try { Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group GitHub | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'was not verified after installation' }
+    if (-not $failed) { throw 'A missing Copilot CLI was accepted after WinGet installation.' }
 }
 
 & {
@@ -255,6 +367,9 @@ exit 37
     $queried = [Collections.Generic.List[string]]::new()
     $wslReady = $true
     $installation = [pscustomobject]@{ Enabled = $false; Installed = $false; Arguments = @() }
+    $script:PendingRestart = $false
+    $script:RestartAfterInstall = $false
+    function Test-RebootPending { return $script:PendingRestart }
     function Test-WslPlatform { return $wslReady }
     function Get-LatestPowerShell7Version { return '7.5.2' }
     function Invoke-WinGetCommand {
@@ -262,6 +377,7 @@ exit 37
         if ($installation.Enabled -and $Arguments[0] -eq 'install') {
             $installation.Arguments = $Arguments
             $installation.Installed = $true
+            if ($script:RestartAfterInstall) { $script:PendingRestart = $true }
             return 0
         }
         if ($Arguments[0] -ne 'list') { throw 'Unexpected WinGet installation in test.' }
@@ -318,6 +434,13 @@ exit 37
         throw 'Docker installation did not supply an installer override.'
     }
     $script:DockerOverrideArgument = $installation.Arguments[$overrideIndex + 1]
+    $installation.Installed = $false
+    $script:RestartAfterInstall = $true
+    $script:RestartRequired = $false
+    if ((Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group Containers) -or
+        -not $script:RestartRequired) {
+        throw 'A pending restart after Docker installation was not reported.'
+    }
 }
 
 & {
@@ -337,6 +460,7 @@ exit 37
     $nodeFailure = $false
     function Write-InstallMessage { param([string]$Message) $messages.Add($Message) }
     function Update-ProcessPath { }
+    function Test-RebootPending { return $false }
     function Initialize-WinGet { param([string]$LogDirectory) $events.Add('winget'); return 'winget' }
     function Install-DevToolPackages {
         param([string]$WinGetExecutable, [string]$LogDirectory, [string]$Group)
@@ -814,8 +938,8 @@ param([string]$Track, [switch]$Yes)
 exit 37
 '@)
         $env:APPMOD_BOOTSTRAP_TEST_OUTPUT = $result
-        function Find-WorkshopPowerShell { return (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source }
-        $code = Invoke-WorkshopPowerShell -ScriptPath $worker `
+        function Find-VmPowerShell { return (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source }
+        $code = Invoke-VmPowerShell -ScriptPath $worker `
             -BoundParameters @{ Track = 'dotnet'; Yes = $true } -RemainingArguments @()
         $stored = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
         if ($code -ne 37 -or $stored.Track -ne 'dotnet' -or -not $stored.Yes) {
@@ -879,7 +1003,7 @@ exit 37
         $errors = $null
         $path = Join-Path $RepositoryRoot "$project/scripts/install-vm-tools.ps1"
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
-        $name = if ($project -eq 'agent-box') { 'Get-CopilotAppVersion' } else { 'Get-VmCopilotVersion' }
+        $name = 'Get-CopilotAppVersion'
         $definition = $ast.Find({
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -912,7 +1036,7 @@ exit 37
             $errors = $null
             $path = Join-Path $RepositoryRoot "$project/scripts/install-vm-tools.ps1"
             $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
-            $name = if ($project -eq 'agent-box') { 'Install-CopilotApp' } else { 'Install-VmCopilot' }
+            $name = 'Install-CopilotApp'
             $definition = $ast.Find({
                 param($node)
                 $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -924,7 +1048,6 @@ exit 37
                 $script:CopilotVersionChecks++
                 if ($script:CopilotVersionChecks -gt 1) { return [version]'1.2.3' }
             }
-            function Get-VmCopilotVersion { Get-CopilotAppVersion }
             function Confirm-InstallAction { return $true }
             function Write-InstallMessage { }
             function Invoke-RestMethod {
@@ -999,16 +1122,39 @@ exit 37
                     $result.CombinedOutput -notmatch 'stderr:value with spaces') {
                     throw "$project command logs did not preserve arguments, streams, or the exit code (streaming=$streaming)."
                 }
-                if ($project -eq 'agent-box' -and -not $streaming) {
+                if ($streaming) {
+                    $dockerOverride = if ($project -eq 'agent-box') {
+                        $script:DockerOverrideArgument
+                    } else { $script:AppmodDockerOverrideArgument }
                     $dockerResult = Invoke-LoggedProcess -Executable $executable -Arguments @(
-                        '-NoLogo', '-NoProfile', '-NonInteractive', '-File', "`"$fixture`"", $script:DockerOverrideArgument
-                    ) -LogDirectory $logDirectory -Quiet
+                        '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $fixture, $dockerOverride
+                    ) -LogDirectory $logDirectory -StreamOutput -Quiet
                     if ($dockerResult.ExitCode -ne 37 -or
                         $dockerResult.StandardOutput.Trim() -cne 'stdout:install --backend=wsl-2') {
-                        throw 'Docker installer override was not passed as one process argument.'
+                        throw "$project Docker installer override was not passed as one process argument."
                     }
                 }
             }
+        }
+        $tokens = $null
+        $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
+        foreach ($name in @('Invoke-LoggedProcess', 'Invoke-WinGetCommand')) {
+            $definition = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+            }, $true)
+            Invoke-Expression $definition.Extent.Text
+        }
+        $logDirectory = Join-Path $temporary 'agent-winget'
+        $null = New-Item -ItemType Directory -Path $logDirectory
+        $code = Invoke-WinGetCommand -Executable $executable -Arguments @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $fixture, $script:DockerOverrideArgument
+        ) -LogDirectory $logDirectory
+        $output = Get-ChildItem -LiteralPath $logDirectory -Filter 'command-*.stdout.log' |
+            Get-Content -Raw
+        if ($code -ne 37 -or $output.Trim() -cne 'stdout:install --backend=wsl-2') {
+            throw 'Agent WinGet invocation did not pass the Docker override as one process argument.'
         }
     }
     finally {

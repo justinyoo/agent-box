@@ -42,14 +42,20 @@ try {
     & {
         $Yes = $true
         $script:VmPackagePresent = $false; $script:RestartRequired = $false
+        $logDirectory = $fixture
         function Test-InstallInteractive { return $true }
         function Read-Host { throw 'Yes must not prompt' }
         function Update-ProcessPath { }
-        function winget {
-            Assert-True ($args -contains '--accept-source-agreements' -and
-                $args -contains '--disable-interactivity') 'Yes accepts source agreements during version discovery too'
-            $global:LASTEXITCODE=0
-            "Versions`n2.0.1"
+        function Get-Command {
+            param($Name, $CommandType, $ErrorAction)
+            if ($Name -eq 'winget') { return [pscustomobject]@{ Source = 'fixture-winget.exe' } }
+            return Microsoft.PowerShell.Core\Get-Command -Name $Name -CommandType $CommandType -ErrorAction $ErrorAction
+        }
+        function Invoke-LoggedProcess {
+            param($Executable, $Arguments, $LogDirectory, [switch]$StreamOutput)
+            Assert-True ($Arguments -contains '--accept-source-agreements' -and
+                $Arguments -contains '--disable-interactivity' -and $StreamOutput) 'Yes accepts source agreements during version discovery too'
+            return [pscustomobject]@{ ExitCode = 0; StandardOutput = "Versions`n2.0.1" }
         }
         Assert-True ((Get-VmWingetVersion Fixture.Package '^2\.\d+\.\d+$') -eq '2.0.1') 'Yes retains stable package version selection'
         function Invoke-VmInstaller {
@@ -837,17 +843,17 @@ function Enable-WindowsOptionalFeature {
     }
 
     & {
-        function Get-VmCopilotVersion { return $null }
+        function Get-CopilotAppVersion { return $null }
         function Confirm-InstallAction { return $false }
         function Invoke-RestMethod { throw 'must not download without consent' }
-        Assert-True (-not (Install-VmCopilot)) 'Copilot consent precedes release discovery'
-        function Get-VmCopilotVersion { return [version]'1.3.0' }
-        Assert-True (Install-VmCopilot) 'existing Copilot app is preserved'
+        Assert-True (-not (Install-CopilotApp)) 'Copilot consent precedes release discovery'
+        function Get-CopilotAppVersion { return [version]'1.3.0' }
+        Assert-True (Install-CopilotApp) 'existing Copilot app is preserved'
     }
 
     & {
         $script:CopilotVersion=$null; $script:MsiCalls=0; $script:SignatureStatus='Valid'
-        function Get-VmCopilotVersion { $script:CopilotVersion }
+        function Get-CopilotAppVersion { $script:CopilotVersion }
         function Confirm-InstallAction { return $true }
         function Invoke-RestMethod {
             [pscustomobject]@{ tag_name='v1.3.0'; prerelease=$false; draft=$false; assets=@(
@@ -871,10 +877,10 @@ function Enable-WindowsOptionalFeature {
             $script:MsiCalls++; $script:CopilotVersion=[version]'1.3.0'
             [pscustomobject]@{ExitCode=0}
         }
-        Assert-True (Install-VmCopilot) 'Copilot verifies digest, signature and installed version'
+        Assert-True (Install-CopilotApp) 'Copilot verifies digest, signature and installed version'
         Assert-True (-not (Test-Path -LiteralPath $script:DownloadedMsi)) 'successful MSI download is cleaned up'
         $script:CopilotVersion=$null; $script:SignatureStatus='NotSigned'
-        Assert-Throws { Install-VmCopilot } 'signature' 'unsigned MSI never executes'
+        Assert-Throws { Install-CopilotApp } 'signature' 'unsigned MSI never executes'
         Assert-True ($script:MsiCalls -eq 1 -and -not (Test-Path -LiteralPath $script:DownloadedMsi)) 'failed MSI verification cleans up without execution'
     }
 
@@ -898,7 +904,7 @@ function Enable-WindowsOptionalFeature {
         function Install-VmNvm { $script:InstallationOrder.Add('Node'); $script:CliSteps.Add('nvm'); return $true }
         function Install-VmDotnetSdk { param($Major); $script:InstallationOrder.Add("SDK$Major"); return $true }
         function Install-VmPostgresClient { $script:InstallationOrder.Add('PostgreSQL'); return $true }
-        function Install-VmCopilot { $script:InstallationOrder.Add('CopilotApp'); return $true }
+        function Install-CopilotApp { $script:InstallationOrder.Add('CopilotApp'); return $true }
         function Install-VmVisualStudio {
             param($Product,$ConfigFile)
             Assert-True ($Product -eq 'BuildTools') 'installer never requests a Community installation'
@@ -942,14 +948,18 @@ function Enable-WindowsOptionalFeature {
             $groupMessages = @($rendered | Where-Object { $_.Text.StartsWith('[INFO] === ') })
             Assert-True (($groupMessages.Text -join ',') -ceq ($expectedGroups -join ',')) 'each installation group heading appears once in order'
             $script:CopilotCliCode=0
-            function Invoke-ToolProbe {
-                param($Name,$Arguments)
-                Assert-True ($Name -eq 'copilot' -and ($Arguments -join ' ') -eq '--version') 'Copilot CLI verification only probes its version without starting a session'
-                [pscustomobject]@{ Code=$script:CopilotCliCode; Text='fixture Copilot CLI version' }
+            $logDirectory = $fixture
+            function Update-ProcessPath { }
+            function Get-Command { return [pscustomobject]@{ Source = 'fixture-copilot.exe' } }
+            function Invoke-LoggedProcess {
+                param($Executable,$Arguments,$LogDirectory,[switch]$StreamOutput,[switch]$Quiet)
+                Assert-True ($Executable -eq 'fixture-copilot.exe' -and ($Arguments -join ' ') -eq '--version' -and
+                    $StreamOutput -and $Quiet) 'Copilot CLI verification only probes its version without starting a session'
+                [pscustomobject]@{ ExitCode=$script:CopilotCliCode; StandardOutput='fixture Copilot CLI version' }
             }
             Assert-True (& $script:CopilotCliCheck) 'working Copilot CLI is recognized as installed'
             $script:CopilotCliCode=1
-            Assert-True (-not (& $script:CopilotCliCheck)) 'failed Copilot CLI probe does not count as installed'
+            Assert-Throws { & $script:CopilotCliCheck } 'could not be verified' 'failed Copilot CLI probe does not count as installed'
             foreach ($case in @(
                 @{ Status='PASS'; Color='Green' },
                 @{ Status='MANUAL'; Color='Cyan' },
@@ -1009,7 +1019,7 @@ exit 37
         $previousOutput = $env:APPMOD_BOOTSTRAP_TEST_OUTPUT
         try {
             $env:APPMOD_BOOTSTRAP_TEST_OUTPUT = Join-Path $yesFixture 'result.json'
-            $workerCode = Invoke-WorkshopPowerShell -ScriptPath $workerFixture `
+            $workerCode = Invoke-VmPowerShell -ScriptPath $workerFixture `
                 -BoundParameters @{ Track = 'dotnet'; Yes = $true } -RemainingArguments @()
             $workerResult = Get-Content -LiteralPath $env:APPMOD_BOOTSTRAP_TEST_OUTPUT -Raw | ConvertFrom-Json
             Assert-True ($workerCode -eq 37 -and $workerResult.Track -eq 'dotnet' -and $workerResult.Yes) 'bootstrap forwards Yes and preserves the worker exit code'
