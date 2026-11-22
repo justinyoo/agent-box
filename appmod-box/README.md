@@ -1,5 +1,7 @@
 # Windows 11 Development VM
 
+[English](README.md) | [한국어](README.ko.md)
+
 [Repository template guide](../README.md)
 
 `azure.yaml` creates a Windows 11 VM and copies the installation helpers to `$HOME/scripts` for the specified local administrator (default: `appmoduser`). Install the tools after signing in to the VM.
