@@ -104,12 +104,6 @@ Resource names follow the azd starter pattern: `rg-{environmentName}` for the re
 
 1. If prompted to restart, save your work, restart the VM manually, and rerun the same command.
 
-The repository's installer is a template populated with the configured administrator name during deployment. Use the staged file rather than executing the raw repository file directly.
-
-Windows PowerShell 5.1 prepares WinGet and PowerShell 7.x, then reruns the installer in PowerShell 7.x. A pending Windows restart stops installation and must be completed manually. The installer does not automatically reboot Windows, authenticate Azure or GitHub tools, sign in to the Copilot app, launch Docker Desktop, or create the first Ubuntu user.
-
-Logs are written below `C:\ProgramData\AgentBox\Logs\DevTools`. The `install.log` file contains the transcript; major installation and verification commands have separate `command-*.stdout.log` and `command-*.stderr.log` files.
-
 ### Tools installed
 
 The installer follows the order below and stops when a restart is required.
