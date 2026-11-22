@@ -235,6 +235,7 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     $events = [Collections.Generic.List[string]]::new()
     $messages = [Collections.Generic.List[string]]::new()
     $packageFailure = ''
+    $nodeFailure = $false
     function Write-InstallMessage { param([string]$Message) $messages.Add($Message) }
     function Update-ProcessPath { }
     function Initialize-WinGet { param([string]$LogDirectory) $events.Add('winget'); return 'winget' }
@@ -251,9 +252,15 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     function Test-WslPlatform { return $true }
     function Install-UbuntuWsl { $events.Add('ubuntu'); return $true }
     function Install-NvmForWindows { param([string]$LogDirectory) $events.Add('nvm'); return $true }
-    function Install-LanguageRuntimes {
+    function Install-NodeRuntime {
+        param([string]$LogDirectory)
+        $events.Add('node')
+        if ($nodeFailure) { throw 'fixture Node failure' }
+        return $true
+    }
+    function Install-PythonRuntime {
         param([string]$PythonVersion, [string]$LogDirectory)
-        $events.Add('language-runtimes')
+        $events.Add("python:$PythonVersion")
         return $true
     }
     function Install-CopilotApp { $events.Add('copilot-app'); return $true }
@@ -263,7 +270,7 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     }
     $expectedEvents = @(
         'winget', 'packages:Prerequisites', 'wsl', 'ubuntu', 'packages:Runtimes',
-        'nvm', 'language-runtimes', 'packages:Containers', 'packages:GitHub',
+        'nvm', 'node', 'python:3.14', 'packages:Containers', 'packages:GitHub',
         'packages:Azure', 'packages:Editors', 'copilot-app', 'verification'
     )
     if (($events -join ',') -cne ($expectedEvents -join ',')) {
@@ -275,6 +282,15 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
         if (-not $stages[$index].Contains("[$($index + 1)/7]")) {
             throw 'Agent Box installation stage numbers are out of order.'
         }
+        $events.Clear()
+        $messages.Clear()
+        $nodeFailure = $true
+        if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 1 -or
+            $events -notcontains 'python:3.14' -or
+            -not ($messages | Where-Object { $_ -match '^\[FAIL\] Node\.js installation failed: fixture Node failure' })) {
+            throw 'A Node.js failure prevented Python installation or was not reported.'
+        }
+        $nodeFailure = $false
     }
     $packageFailure = 'restart'
     if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 3010) {
@@ -284,6 +300,65 @@ if ($installer -match 'Complete-FirstSignInSetup|ScheduledTask|Intune|enrollment
     if ((Invoke-VmToolInstallation -LogDirectory 'temp' -PythonVersion '3.14') -ne 1) {
         throw 'Agent Box did not return an incomplete-installation status.'
     }
+}
+
+& {
+    Set-StrictMode -Version Latest
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($installer, [ref]$tokens, [ref]$errors)
+    foreach ($name in @('Invoke-ToolCommand', 'Install-NodeRuntime', 'Install-PythonRuntime')) {
+        $definition = $ast.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+        }, $true)
+        if (-not $definition) { throw "Missing Agent Box runtime function: $name" }
+        Invoke-Expression $definition.Extent.Text
+    }
+    function Get-Command { param($Name, $CommandType, $ErrorAction) return [pscustomobject]@{ Source = 'fixture.exe' } }
+    function Invoke-LoggedProcess {
+        param($Executable, $Arguments, $LogDirectory)
+        return [pscustomobject]@{ ExitCode = 0; StandardOutput = $null }
+    }
+    $output = Invoke-ToolCommand -CommandName 'fixture.exe' -Arguments @() -LogDirectory 'temp'
+    if ($output -ne '') { throw 'Successful native commands with no stdout must return an empty string.' }
+
+    $calls = [Collections.Generic.List[string]]::new()
+    $script:NodeOutput = '{"version":"26.13.1","lts":"fixture","arch":"x64"}'
+    $pythonPath = (Get-Process -Id $PID).Path
+    function Confirm-InstallAction { return $true }
+    function Write-InstallMessage { }
+    function Update-ProcessPath { }
+    function Get-LatestNodeLts { return [pscustomobject]@{ Version = '26.13.1'; Lts = 'fixture' } }
+    function Get-NvmVersion { return '2.0.1' }
+    function Invoke-ToolCommand {
+        param($CommandName, $Arguments, $LogDirectory)
+        $calls.Add("$CommandName $($Arguments -join ' ')")
+        if ($CommandName -eq 'node.exe') { return $script:NodeOutput }
+        if ($CommandName -eq 'uv.exe' -and $Arguments[0] -eq 'python' -and $Arguments[1] -eq 'find') {
+            return $pythonPath
+        }
+        if ($CommandName -eq $pythonPath) { return 'Python 3.14.2' }
+        return ''
+    }
+    if (-not (Install-NodeRuntime -LogDirectory 'temp')) { throw 'Valid Node runtime was not accepted.' }
+    if (-not (Install-PythonRuntime -PythonVersion '3.14' -LogDirectory 'temp')) {
+        throw 'The uv-managed Python installation was not verified.'
+    }
+    if ($calls -notcontains 'uv.exe python install 3.14 --upgrade --no-config --no-progress' -or
+        $calls -notcontains 'uv.exe python find cpython3.14 --managed-python --no-python-downloads --no-project --system --no-config') {
+        throw 'The latest Python 3.14 patch was not installed and located through uv.'
+    }
+    $script:NodeOutput = ''
+    $failed = $false
+    try { Install-NodeRuntime -LogDirectory 'temp' | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'Node.js did not return runtime information' }
+    if (-not $failed) { throw 'An empty Node runtime response did not produce an actionable error.' }
+    $script:NodeOutput = 'null'
+    $failed = $false
+    try { Install-NodeRuntime -LogDirectory 'temp' | Out-Null }
+    catch { $failed = $_.Exception.Message -match 'Active Node.js does not match' }
+    if (-not $failed) { throw 'A null Node runtime response did not produce an actionable error.' }
 }
 
 & {

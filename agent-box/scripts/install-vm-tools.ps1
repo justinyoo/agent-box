@@ -203,7 +203,7 @@ function Invoke-ToolCommand {
     if ($result.ExitCode -ne 0) {
         throw ('{0} failed (0x{1:X8}). See {2}.' -f $CommandName, $result.ExitCode, $LogDirectory)
     }
-    return $result.StandardOutput.Trim()
+    return ([string]$result.StandardOutput).Trim()
 }
 
 function Update-ProcessPath {
@@ -719,12 +719,8 @@ function Get-LatestNodeLts {
     }
 }
 
-function Install-LanguageRuntimes {
-    param(
-        [ValidatePattern('^3\.\d+$')]
-        [string]$PythonVersion,
-        [string]$LogDirectory
-    )
+function Install-NodeRuntime {
+    param([string]$LogDirectory)
 
     $node = Get-LatestNodeLts
     if (-not (Confirm-InstallAction "Install and activate Node.js LTS $($node.Version) through nvm-windows.")) {
@@ -746,8 +742,12 @@ function Install-LanguageRuntimes {
     $nodeJson = Invoke-ToolCommand -CommandName 'node.exe' -Arguments @(
         '-p', 'JSON.stringify({version:process.versions.node,lts:process.release.lts,arch:process.arch})'
     ) -LogDirectory $LogDirectory
+    if ([string]::IsNullOrWhiteSpace($nodeJson)) {
+        throw "Node.js did not return runtime information. See $LogDirectory."
+    }
     $activeNode = $nodeJson | ConvertFrom-Json -ErrorAction Stop
-    if (-not $activeNode.PSObject.Properties['version'] -or
+    if ($null -eq $activeNode -or
+        -not $activeNode.PSObject.Properties['version'] -or
         -not $activeNode.PSObject.Properties['lts'] -or
         -not $activeNode.PSObject.Properties['arch'] -or
         $activeNode.version -ne $node.Version -or
@@ -757,7 +757,15 @@ function Install-LanguageRuntimes {
     }
     Invoke-ToolCommand -CommandName 'npm' -Arguments @('--version') `
         -LogDirectory $LogDirectory | Out-Null
+    return $true
+}
 
+function Install-PythonRuntime {
+    param(
+        [ValidatePattern('^3\.\d+$')]
+        [string]$PythonVersion,
+        [string]$LogDirectory
+    )
     if (-not (Confirm-InstallAction "Install the latest Python $PythonVersion patch available to uv.")) {
         Write-InstallMessage '[MANUAL] Skipped the Python installation.'
         return $false
@@ -839,14 +847,22 @@ function Invoke-VmToolInstallation {
         $complete = $false
         if ($script:RestartRequired) { return 3010 }
     }
-    if (-not (Install-NvmForWindows -LogDirectory $LogDirectory)) {
-        Write-InstallMessage '[MANUAL] nvm-windows is not ready.'
-        $complete = $false
-    }
-    else {
-        if (-not (Install-LanguageRuntimes -PythonVersion $PythonVersion -LogDirectory $LogDirectory)) {
+    try {
+        if (-not (Install-NvmForWindows -LogDirectory $LogDirectory)) {
+            Write-InstallMessage '[MANUAL] nvm-windows is not ready.'
             $complete = $false
         }
+        elseif (-not (Install-NodeRuntime -LogDirectory $LogDirectory)) {
+            $complete = $false
+        }
+    }
+    catch {
+        Write-InstallMessage "[FAIL] Node.js installation failed: $($_.Exception.Message)"
+        if ($_.ScriptStackTrace) { Write-InstallMessage "[INFO] $($_.ScriptStackTrace)" }
+        $complete = $false
+    }
+    if (-not (Install-PythonRuntime -PythonVersion $PythonVersion -LogDirectory $LogDirectory)) {
+        $complete = $false
     }
 
     foreach ($group in @(
@@ -903,6 +919,7 @@ try {
 }
 catch {
     Write-Error "[FAIL] $($_.Exception.Message)" -ErrorAction Continue
+    if ($_.ScriptStackTrace) { Write-InstallMessage "[INFO] $($_.ScriptStackTrace)" }
     exit 1
 }
 finally {
