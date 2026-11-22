@@ -308,6 +308,16 @@ exit 37
         $installation.Arguments -notcontains '--version' -or $installation.Arguments -notcontains '7.5.2') {
         throw 'PowerShell bootstrap did not request the selected stable 7.x version.'
     }
+    $wslReady = $true
+    $installation.Installed = $false
+    if (-not (Install-DevToolPackages -WinGetExecutable winget -LogDirectory temp -Group Containers)) {
+        throw 'Docker package was not installed and verified.'
+    }
+    $overrideIndex = [array]::IndexOf($installation.Arguments, '--override')
+    if ($overrideIndex -lt 0 -or $overrideIndex -ge ($installation.Arguments.Count - 1)) {
+        throw 'Docker installation did not supply an installer override.'
+    }
+    $script:DockerOverrideArgument = $installation.Arguments[$overrideIndex + 1]
 }
 
 & {
@@ -988,6 +998,15 @@ exit 37
                     $result.CombinedOutput -notmatch 'stdout:value with spaces' -or
                     $result.CombinedOutput -notmatch 'stderr:value with spaces') {
                     throw "$project command logs did not preserve arguments, streams, or the exit code (streaming=$streaming)."
+                }
+                if ($project -eq 'agent-box' -and -not $streaming) {
+                    $dockerResult = Invoke-LoggedProcess -Executable $executable -Arguments @(
+                        '-NoLogo', '-NoProfile', '-NonInteractive', '-File', "`"$fixture`"", $script:DockerOverrideArgument
+                    ) -LogDirectory $logDirectory -Quiet
+                    if ($dockerResult.ExitCode -ne 37 -or
+                        $dockerResult.StandardOutput.Trim() -cne 'stdout:install --backend=wsl-2') {
+                        throw 'Docker installer override was not passed as one process argument.'
+                    }
                 }
             }
         }

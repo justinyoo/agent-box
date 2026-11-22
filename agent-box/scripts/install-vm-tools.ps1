@@ -469,7 +469,7 @@ function Install-DevToolPackages {
         @{ Group = 'Runtimes'; Id = 'Microsoft.DotNet.SDK.10'; Name = '.NET 10 SDK'; Extra = @() }
         @{ Group = 'Runtimes'; Id = 'Microsoft.DotNet.SDK.11'; Name = '.NET 11 SDK'; Extra = @() }
         @{ Group = 'Runtimes'; Id = 'astral-sh.uv'; Name = 'uv'; Extra = @() }
-        @{ Group = 'Containers'; Id = 'Docker.DockerDesktop'; Name = 'Docker Desktop (WSL2 backend)'; Extra = @('--override', 'install --backend=wsl-2') }
+        @{ Group = 'Containers'; Id = 'Docker.DockerDesktop'; Name = 'Docker Desktop (WSL2 backend)'; Extra = @('--override', '"install --backend=wsl-2"') }
         @{ Group = 'GitHub'; Id = 'Git.Git'; Name = 'Git'; Extra = @() }
         @{ Group = 'GitHub'; Id = 'GitHub.cli'; Name = 'GitHub CLI'; Extra = @() }
         @{ Group = 'GitHub'; Id = 'GitHub.Copilot'; Name = 'GitHub Copilot CLI'; Extra = @() }
