@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "files": {
+    "agent-box/README.md": {
+      "source_commit": null,
+      "source_sha256": "4957e42f44f709ccc801aa1436f5361af52f287858cf8d9b5492c1e22512aab3",
+      "localized_sha256": "fc6d7f368a65842cab1a18d8777b62a04c36555f742b7f46c1117d80bdc6841d"
+    }
+  }
+}

@@ -1,5 +1,7 @@
 # Agent Box
 
+**English** | [한국어](README.ko.md)
+
 [Repository template guide](../README.md)
 
 Agent Box provisions a Windows 11 Enterprise development VM with Bastion Developer access and a NAT Gateway. It also creates a Microsoft Foundry account and project with a `MAI-Image-2.7` deployment. Tool installation and user sign-in are manual.
