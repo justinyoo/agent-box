@@ -118,11 +118,7 @@ The installer follows the order below and stops when a restart is required.
 | 7. Editors and apps | VS Code | `Microsoft.VisualStudioCode` |
 | 7. Editors and apps | GitHub Copilot app | Official `github/app` x64 MSI. Verify the GitHub Authenticode signature and the release SHA-256 digest when published |
 
-Existing tools and unrelated Python and Node installations are preserved. The installer does not replace an existing nvm 1.x installation. For Copilot CLI, it checks `copilot --version` before and after installation, preserving a working CLI even if WinGet does not list it.
-
-Python installation is attempted even if Node.js setup fails; the installer still reports the Node.js failure. The Python patch version is the latest available in the installed uv release's download catalog. If no conflicting uv-bin executable exists, the installer uses uv's experimental `--default` option to create `python.exe` even when another Python command takes precedence. It then reports any command or PATH conflict for manual resolution without changing PATH order. Use `uv python list --only-installed` to check uv-managed installations.
-
-The installer preserves existing PATH entries and their order. When needed and there is no conflict, it asks before appending the runtime directory to the signed-in user's PATH (`-Yes` approves this). It never changes the system PATH for runtime priority. A conflicting `node` or `python`, including a WindowsApps alias, must be resolved manually before activation. Existing terminals may need to be reopened or the user signed out and back in. Previous versions of this installer may already have modified the system PATH; this version does not undo those changes.
+If no conflicting uv-bin executable exists, the installer uses uv's experimental `--default` option to create `python.exe` even when another Python command takes precedence.
 
 ### Manual post-installation steps
 
